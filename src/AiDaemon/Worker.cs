@@ -117,6 +117,13 @@ public class Worker : BackgroundService
         var seen = 0;
         var dropped = 0;
         var actionable = 0;
+        var coalesced = 0;
+
+        // Branches we've already dispatched (or would dispatch in Phase 4) this tick. A second
+        // notification on the same branch within one poll gets logged + recorded but doesn't
+        // re-fire the spawn / heads-up path. Cross-tick reuse is handled separately by the
+        // branches table's RcActive state in Phase 4.
+        var dispatchedThisTick = new HashSet<string>(StringComparer.Ordinal);
 
         await foreach (var n in _poller.PollAsync(cancellationToken))
         {
@@ -168,6 +175,14 @@ public class Worker : BackgroundService
                 {
                     outcome = "actionable:unresolved";
                 }
+                else if (!dispatchedThisTick.Add(branch.Key))
+                {
+                    coalesced++;
+                    outcome = $"actionable:coalesced:{branch.Key}";
+                    _logger.LogInformation(
+                        "coalesced thread={ThreadId} branch={Branch} (already dispatched this tick)",
+                        n.Id, branch.Key);
+                }
                 else
                 {
                     outcome = $"actionable:{branch.Key}";
@@ -183,8 +198,8 @@ public class Worker : BackgroundService
 
         if (seen > 0)
             _logger.LogInformation(
-                "tick seen={Seen} dropped={Dropped} actionable={Actionable}",
-                seen, dropped, actionable);
+                "tick seen={Seen} dropped={Dropped} actionable={Actionable} coalesced={Coalesced} branches={Branches}",
+                seen, dropped, actionable, coalesced, dispatchedThisTick.Count);
         else
             _logger.LogDebug("tick (no new notifications)");
     }
