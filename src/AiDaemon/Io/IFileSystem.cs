@@ -14,7 +14,17 @@ public interface IFileSystem
 
     bool FileExists(string path);
 
+    /// <summary>
+    /// Reads the file using <see cref="FileShare.ReadWrite"/> so a concurrent writer
+    /// (e.g. claude updating <c>~/.claude/sessions/&lt;pid&gt;.json</c>) doesn't cause us
+    /// to fail. Throws on missing file / IO error — caller decides whether to retry.
+    /// </summary>
     string ReadAllText(string path);
+
+    void WriteAllText(string path, string content);
+
+    /// <summary>Best-effort delete: returns silently if the file is already gone.</summary>
+    void DeleteFile(string path);
 
     DateTime GetLastWriteTimeUtc(string path);
 }
@@ -28,7 +38,25 @@ public class FileSystem : IFileSystem
 
     public bool FileExists(string path) => File.Exists(path);
 
-    public string ReadAllText(string path) => File.ReadAllText(path);
+    public string ReadAllText(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var sr = new StreamReader(fs);
+        return sr.ReadToEnd();
+    }
+
+    public void WriteAllText(string path, string content)
+    {
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+        File.WriteAllText(path, content);
+    }
+
+    public void DeleteFile(string path)
+    {
+        try { File.Delete(path); } catch (FileNotFoundException) { } catch (DirectoryNotFoundException) { }
+    }
 
     public DateTime GetLastWriteTimeUtc(string path) => File.GetLastWriteTimeUtc(path);
 }

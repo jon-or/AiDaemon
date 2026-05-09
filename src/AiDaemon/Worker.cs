@@ -15,6 +15,7 @@ public class Worker : BackgroundService
     readonly INotificationPoller _poller;
     readonly ITriagePipeline _triage;
     readonly IBranchResolver _resolver;
+    readonly IDispatcher _dispatcher;
 
     Mutex? _instanceMutex;
 
@@ -25,7 +26,8 @@ public class Worker : BackgroundService
         IStateStore stateStore,
         INotificationPoller poller,
         ITriagePipeline triage,
-        IBranchResolver resolver)
+        IBranchResolver resolver,
+        IDispatcher dispatcher)
     {
         _logger = logger;
         _options = options;
@@ -34,6 +36,7 @@ public class Worker : BackgroundService
         _poller = poller;
         _triage = triage;
         _resolver = resolver;
+        _dispatcher = dispatcher;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -48,6 +51,16 @@ public class Worker : BackgroundService
         }
 
         await _stateStore.InitializeAsync(cancellationToken);
+
+        try
+        {
+            await _dispatcher.ReconcileOnStartupAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "startup reconciliation failed — continuing");
+        }
+
         await base.StartAsync(cancellationToken);
     }
 
@@ -87,6 +100,15 @@ public class Worker : BackgroundService
                 }
                 else
                 {
+                    try
+                    {
+                        await _dispatcher.SweepAsync(stoppingToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "sweep failed");
+                    }
+
                     await TickAsync(stoppingToken);
                 }
             }
@@ -185,11 +207,27 @@ public class Worker : BackgroundService
                 }
                 else
                 {
-                    outcome = $"actionable:{branch.Key}";
                     _logger.LogInformation(
                         "resolved thread={ThreadId} branch={Branch} worktree={Worktree} pr={Pr} issue={Issue}",
                         n.Id, branch.Branch, branch.Worktree, branch.PrNumber, branch.IssueNumber);
-                    // Phase 4 will dispatch an RC session here.
+
+                    DispatchOutcome dispatchOutcome;
+                    try
+                    {
+                        dispatchOutcome = await _dispatcher.DispatchAsync(branch, n, verdict, cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "dispatch threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
+                        dispatchOutcome = DispatchOutcome.Failed;
+                    }
+
+                    outcome = dispatchOutcome switch
+                    {
+                        DispatchOutcome.Spawned => $"spawned:{branch.Key}",
+                        DispatchOutcome.HeadsUp => $"heads_up:{branch.Key}",
+                        _ => $"failed:{branch.Key}",
+                    };
                 }
             }
 
