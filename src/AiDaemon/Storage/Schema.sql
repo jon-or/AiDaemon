@@ -29,3 +29,8 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   count           INTEGER NOT NULL,
   PRIMARY KEY (thread_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS kv (
+  key             TEXT PRIMARY KEY,
+  value           TEXT NOT NULL
+);

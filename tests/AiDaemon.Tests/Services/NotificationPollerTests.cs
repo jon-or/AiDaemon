@@ -56,9 +56,27 @@ public class NotificationPollerTests : IDisposable
     }
 
     [Fact]
+    public async Task PollAsync_FirstRun_AnchorsCursorAtNow_AndYieldsNothing()
+    {
+        // First poll with no cursor: poller writes 'now' as the cursor before fetching, then
+        // calls gh with that cursor. We assert it asked gh with a non-null since.
+        DateTimeOffset? capturedSince = null;
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .Callback((DateTimeOffset? since, CancellationToken _) => capturedSince = since)
+            .ReturnsAsync(Array.Empty<GhNotification>());
+
+        var got = await CollectAsync();
+
+        Assert.Empty(got);
+        Assert.NotNull(capturedSince);
+        var stored = await _store.GetKvAsync(StateStoreKeys.NotificationCursor, default);
+        Assert.False(string.IsNullOrEmpty(stored));
+    }
+
+    [Fact]
     public async Task PollAsync_YieldsAllUnseenOnFirstPass()
     {
-        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<CancellationToken>()))
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[]
             {
                 N("1", "https://api.github.com/repos/o/r/issues/comments/100"),
@@ -78,7 +96,7 @@ public class NotificationPollerTests : IDisposable
         var commentUrl = "https://api.github.com/repos/o/r/issues/comments/100";
         await _store.MarkProcessedAsync("1", "100", "seen", default);
 
-        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<CancellationToken>()))
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[] { N("1", commentUrl), N("2", null) });
 
         var got = await CollectAsync();
@@ -88,7 +106,7 @@ public class NotificationPollerTests : IDisposable
     }
 
     [Fact]
-    public async Task DeriveCommentId_UsesUrlLastSegment_OrUpdatedAtSentinel()
+    public void DeriveCommentId_UsesUrlLastSegment_OrUpdatedAtSentinel()
     {
         Assert.Equal(
             "100",
@@ -107,10 +125,9 @@ public class NotificationPollerTests : IDisposable
     [Fact]
     public async Task PollAsync_WithSameThreadDifferentComment_YieldsAgain()
     {
-        // First comment seen, second comment on the same thread should still fire.
         await _store.MarkProcessedAsync("1", "100", "seen", default);
 
-        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<CancellationToken>()))
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[]
             {
                 N("1", "https://api.github.com/repos/o/r/issues/comments/200"),
@@ -123,9 +140,53 @@ public class NotificationPollerTests : IDisposable
     }
 
     [Fact]
+    public async Task PollAsync_AdvancesCursorPastMaxUpdatedAt()
+    {
+        // Seed an old cursor so the test's mock data (also old) is "newer" than the cursor
+        // and the advance path actually runs.
+        var seeded = DateTimeOffset.UtcNow.AddDays(-1);
+        await _store.SetKvAsync(StateStoreKeys.NotificationCursor, seeded.ToString("O"), default);
+
+        var t0 = seeded.AddMinutes(10);
+        var latest = t0.AddMinutes(2);
+
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[]
+            {
+                N("1", null, updated: t0),
+                N("2", null, updated: latest),
+                N("3", null, updated: t0.AddMinutes(1)),
+            });
+
+        await CollectAsync();
+
+        var stored = await _store.GetKvAsync(StateStoreKeys.NotificationCursor, default);
+        var parsed = DateTimeOffset.Parse(stored!).ToUniversalTime();
+        Assert.True(parsed > latest, $"cursor {parsed:O} should be past latest {latest:O}");
+        Assert.True(parsed <= latest.AddSeconds(2), $"cursor {parsed:O} should be at most ~1s past latest {latest:O}");
+    }
+
+    [Fact]
+    public async Task PollAsync_PassesPersistedCursorToGh()
+    {
+        var seeded = DateTimeOffset.UtcNow.AddDays(-1);
+        await _store.SetKvAsync(StateStoreKeys.NotificationCursor, seeded.ToString("O"), default);
+
+        DateTimeOffset? captured = null;
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
+            .Callback((DateTimeOffset? since, CancellationToken _) => captured = since)
+            .ReturnsAsync(Array.Empty<GhNotification>());
+
+        await CollectAsync();
+
+        Assert.NotNull(captured);
+        Assert.Equal(seeded.ToUnixTimeSeconds(), captured.Value.ToUnixTimeSeconds());
+    }
+
+    [Fact]
     public async Task PollAsync_AuthFailure_YieldsNothingDoesNotThrow()
     {
-        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<CancellationToken>()))
+        _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new GhAuthException(1, "HTTP 401"));
 
         var got = await CollectAsync();

@@ -9,6 +9,29 @@ var builder = Host.CreateApplicationBuilder(args);
 
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false);
 
+// One-shot subcommands for debugging. Run synchronously and exit.
+if (args.Length >= 1 && args[0] == "set-kv")
+{
+    if (args.Length != 3)
+    {
+        Console.Error.WriteLine("usage: AiDaemon set-kv <key> <value>");
+        return 2;
+    }
+
+    var opts = builder.Configuration
+        .GetSection(DaemonOptions.SectionName)
+        .Get<DaemonOptions>() ?? new DaemonOptions();
+
+    var store = new SqliteStateStore(
+        Microsoft.Extensions.Options.Options.Create(opts),
+        Microsoft.Extensions.Logging.Abstractions.NullLogger<SqliteStateStore>.Instance);
+
+    await store.InitializeAsync(default);
+    await store.SetKvAsync(args[1], args[2], default);
+    Console.WriteLine($"set {args[1]} = {args[2]}");
+    return 0;
+}
+
 builder.Services.AddWindowsService(o => o.ServiceName = "AiDaemon");
 
 builder.Services.Configure<DaemonOptions>(
@@ -41,3 +64,4 @@ builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();
 host.Run();
+return 0;

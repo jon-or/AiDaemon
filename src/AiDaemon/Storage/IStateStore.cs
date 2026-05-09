@@ -24,4 +24,16 @@ public interface IStateStore
     Task<int> IncrementRateLimitAsync(string threadId, DateOnly day, CancellationToken cancellationToken);
 
     Task<int> GetRateLimitAsync(string threadId, DateOnly day, CancellationToken cancellationToken);
+
+    /// <summary>Read a singleton value from the kv table. Returns null if unset.</summary>
+    Task<string?> GetKvAsync(string key, CancellationToken cancellationToken);
+
+    /// <summary>Write a singleton value to the kv table.</summary>
+    Task SetKvAsync(string key, string value, CancellationToken cancellationToken);
+}
+
+public static class StateStoreKeys
+{
+    /// <summary>ISO 8601 timestamp of the most recent notification updated_at we've polled past.</summary>
+    public const string NotificationCursor = "notifications.cursor";
 }

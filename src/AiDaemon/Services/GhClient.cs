@@ -34,12 +34,17 @@ public class GhClient : IGhClient
     public Task ApiVoidAsync(string method, string path, CancellationToken cancellationToken)
         => RunGhAsync(new[] { "api", "-X", method, path }, cancellationToken);
 
-    public async Task<IReadOnlyList<GhNotification>> ListNotificationsAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<GhNotification>> ListNotificationsAsync(DateTimeOffset? since, CancellationToken cancellationToken)
     {
-        // --paginate would auto-walk Link headers, but at this user's scale page 1 is plenty.
-        var result = await RunGhAsync(
-            new[] { "api", "/notifications?participating=true&all=false&per_page=50" },
-            cancellationToken);
+        // all=true: notifications come in pre-marked-read for some accounts (the unread filter
+        // misses too much), so we drive idempotency from a date cursor + the processed table.
+        // --paginate concatenates pages by walking Link headers — fine because `since` keeps the
+        // window bounded.
+        var query = "/notifications?participating=true&all=true&per_page=50";
+        if (since.HasValue)
+            query += $"&since={Uri.EscapeDataString(since.Value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ"))}";
+
+        var result = await RunGhAsync(new[] { "api", "--paginate", query }, cancellationToken);
 
         var list = Deserialize<List<GhNotification>>(result.Stdout, "/notifications");
         return list;

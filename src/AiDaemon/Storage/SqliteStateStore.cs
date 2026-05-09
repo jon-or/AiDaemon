@@ -172,6 +172,27 @@ public class SqliteStateStore : IStateStore
         return (int)newCount;
     }
 
+    public async Task<string?> GetKvAsync(string key, CancellationToken cancellationToken)
+    {
+        await using var conn = await OpenAsync(cancellationToken);
+        return await conn.ExecuteScalarAsync<string?>(new CommandDefinition(
+            "select value from kv where key = $key",
+            new { key },
+            cancellationToken: cancellationToken));
+    }
+
+    public async Task SetKvAsync(string key, string value, CancellationToken cancellationToken)
+    {
+        await using var conn = await OpenAsync(cancellationToken);
+        await conn.ExecuteAsync(new CommandDefinition(
+            """
+            insert into kv (key, value) values ($key, $value)
+            on conflict (key) do update set value = excluded.value
+            """,
+            new { key, value },
+            cancellationToken: cancellationToken));
+    }
+
     public async Task<int> GetRateLimitAsync(string threadId, DateOnly day, CancellationToken cancellationToken)
     {
         var dayKey = day.ToString("yyyy-MM-dd");

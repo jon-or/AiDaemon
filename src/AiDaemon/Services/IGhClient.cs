@@ -16,9 +16,10 @@ public interface IGhClient
     Task ApiVoidAsync(string method, string path, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Lists unread, participating notifications. Backed by <c>/notifications?participating=true&amp;all=false</c>.
+    /// Lists participating notifications updated after <paramref name="since"/> (or all recent if null).
+    /// Backed by <c>/notifications?participating=true&amp;all=true&amp;since=&lt;iso&gt;</c>, paginated.
     /// </summary>
-    Task<IReadOnlyList<GhNotification>> ListNotificationsAsync(CancellationToken cancellationToken);
+    Task<IReadOnlyList<GhNotification>> ListNotificationsAsync(DateTimeOffset? since, CancellationToken cancellationToken);
 
     /// <summary>
     /// Marks a notification thread as read via PATCH <c>/notifications/threads/{id}</c>.
