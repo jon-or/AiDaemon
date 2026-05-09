@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using System.Text;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
@@ -9,6 +10,18 @@ namespace AiDaemon;
 
 public class Worker : BackgroundService
 {
+    /// <summary>
+    /// Telemetry surface. Listeners are opt-in (no overhead if no MeterListener attached);
+    /// the metrics are intended for whatever Prometheus / OpenTelemetry / dotnet-counters
+    /// scrape an operator wires up later. The names are stable contract.
+    /// </summary>
+    static readonly Meter Meter = new("AiDaemon", "1.0.0");
+    static readonly Counter<long> TickSeen = Meter.CreateCounter<long>("aidaemon.tick.seen", description: "Notifications observed in pass 1 of a tick.");
+    static readonly Counter<long> TickDropped = Meter.CreateCounter<long>("aidaemon.tick.dropped", description: "Notifications dropped at L1/L2/L3.");
+    static readonly Counter<long> TickActionable = Meter.CreateCounter<long>("aidaemon.tick.actionable", description: "Branches that produced a real spawn or heads-up.");
+    static readonly Counter<long> TickFailed = Meter.CreateCounter<long>("aidaemon.tick.failed", description: "Branches whose dispatch failed plus per-notification quick-triage / resolve failures.");
+    static readonly Counter<long> TickCoalesced = Meter.CreateCounter<long>("aidaemon.tick.coalesced", description: "Extra notifications absorbed into a peer notification's branch batch (savings vs. one-dispatch-per-notification).");
+
     readonly ILogger<Worker> _logger;
     readonly IOptions<DaemonOptions> _options;
     readonly IHostApplicationLifetime _lifetime;
@@ -373,6 +386,12 @@ public class Worker : BackgroundService
             };
             await MarkAllAsync(batch, outcome, cancellationToken);
         }
+
+        TickSeen.Add(seen);
+        TickDropped.Add(dropped);
+        TickActionable.Add(actionable);
+        TickFailed.Add(failed);
+        TickCoalesced.Add(coalesced);
 
         if (seen > 0)
             _logger.LogInformation(

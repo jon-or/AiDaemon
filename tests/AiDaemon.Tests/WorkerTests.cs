@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using AiDaemon.Services;
@@ -323,6 +324,66 @@ public class WorkerTests
             It.IsAny<GhNotification>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_EmitsMetrics_OneCounterPerOutcomeBucket()
+    {
+        // Two notifications: one drops at L1, one dispatches Spawned. The metrics surface
+        // is contract for whatever exporter an operator wires up.
+        var n1 = N("thread-DROP", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-GO", "https://api.github.com/repos/o/r/issues/comments/2");
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(
+                It.Is<GhNotification>(g => g.Id == "thread-DROP"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("noise"), ""));
+        _triage.Setup(t => t.QuickTriageAsync(
+                It.Is<GhNotification>(g => g.Id == "thread-GO"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TriageVerdict.Actionable("go", "x", 0.9));
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DispatchOutcome.Spawned);
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(s => s.IncrementRateLimitAsync(
+                It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        var observed = new Dictionary<string, long>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "AiDaemon")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<long>((instrument, value, _, _) =>
+        {
+            observed.TryGetValue(instrument.Name, out var prev);
+            observed[instrument.Name] = prev + value;
+        });
+        listener.Start();
+
+        await Build().TickAsync(default);
+
+        listener.Dispose();
+
+        Assert.Equal(2, observed["aidaemon.tick.seen"]);
+        Assert.Equal(1, observed["aidaemon.tick.dropped"]);
+        Assert.Equal(1, observed["aidaemon.tick.actionable"]);
+        Assert.Equal(0, observed.GetValueOrDefault("aidaemon.tick.failed"));
+        // Both notifications resolved to the same branch; one of the two is the "primary" and
+        // the second is the coalesced one.
+        Assert.Equal(0, observed["aidaemon.tick.coalesced"]); // L1-drop wasn't grouped, so coalesced=0
     }
 
     [Fact]
