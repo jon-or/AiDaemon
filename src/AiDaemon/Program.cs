@@ -35,8 +35,10 @@ if (args.Length >= 1 && args[0] == "set-kv")
 
 builder.Services.AddWindowsService(o => o.ServiceName = "AiDaemon");
 
-builder.Services.Configure<DaemonOptions>(
-    builder.Configuration.GetSection(DaemonOptions.SectionName));
+builder.Services.AddOptions<DaemonOptions>()
+    .Bind(builder.Configuration.GetSection(DaemonOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<DaemonOptions>, DaemonOptionsValidator>();
 
 var bootOptions = builder.Configuration
     .GetSection(DaemonOptions.SectionName)
