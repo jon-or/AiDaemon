@@ -260,12 +260,16 @@ public class TriagePipelineTests : IDisposable
     [Fact]
     public async Task Agent_LowConfidenceDrop_StillHonoredAsDrop()
     {
-        // No bias rule — the LLM's verdict is taken directly.
-        StubAgent("drop", 0.6, why: "borderline");
+        // No bias rule — the LLM's verdict is taken directly. Also pin the verdict mapping
+        // so a regression in llm.Confidence/llm.Summary plumbing fails this test.
+        StubAgent("drop", 0.6, why: "borderline", summary: "marker-summary");
 
         var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Drop, v.Action);
+        Assert.Equal(0.6, v.Confidence);
+        Assert.Equal("marker-summary", v.Summary);
+        Assert.Equal("borderline", v.Why);
     }
 
     [Fact]
@@ -308,6 +312,77 @@ public class TriagePipelineTests : IDisposable
         var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
+    }
+
+    [Fact]
+    public async Task Agent_BuildAgentInput_IncludesBranchAndAllBodiesInOrder()
+    {
+        // Pin BuildAgentInput's payload so a regression there (e.g. dropped bodies, swapped
+        // ordering) fails this test rather than silently degrading the classifier.
+        string? capturedUserInput = null;
+        _claude.Setup(c => c.RunHeadlessJsonAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback((string _, string userInput, string _, string _, string _, TimeSpan _, CancellationToken _, string? _, string? _) =>
+                capturedUserInput = userInput)
+            .ReturnsAsync(new ClaudeJsonResult(false, "",
+                JsonSerializer.SerializeToElement(new { action = "actionable", confidence = 0.9, why = "x", summary = "x" }),
+                "end_turn", 100));
+
+        var older = new GhNotification
+        {
+            Id = "thread-A",
+            Reason = "mention",
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-5),
+            Repository = new GhRepositoryRef { FullName = "ownerrez/orez" },
+            Subject = new GhNotificationSubject
+            {
+                Type = "Issue", Title = "older issue title",
+                Url = "https://api.github.com/repos/o/r/issues/1",
+                LatestCommentUrl = "https://api.github.com/repos/o/r/issues/comments/1",
+            },
+        };
+        var newer = new GhNotification
+        {
+            Id = "thread-B",
+            Reason = "review_requested",
+            UpdatedAt = DateTimeOffset.UtcNow,
+            Repository = new GhRepositoryRef { FullName = "ownerrez/orez" },
+            Subject = new GhNotificationSubject
+            {
+                Type = "PullRequest", Title = "newer pr title",
+                Url = "https://api.github.com/repos/o/r/pulls/2",
+                LatestCommentUrl = "https://api.github.com/repos/o/r/pulls/comments/2",
+            },
+        };
+
+        var items = new[]
+        {
+            new NotificationWithBody(newer, "BODY-NEWER-MARKER"),
+            new NotificationWithBody(older, "BODY-OLDER-MARKER"),
+        };
+
+        await _pipeline.AgentTriageAsync(items, Branch(), default);
+
+        Assert.NotNull(capturedUserInput);
+        // Branch metadata.
+        Assert.Contains("16119-isdpvirtualproperty", capturedUserInput);
+        Assert.Contains("ownerrez/orez", capturedUserInput);
+        Assert.Contains("Issue: #16119", capturedUserInput);
+        // Multi-item header.
+        Assert.Contains("2 notifications", capturedUserInput);
+        // Both bodies present.
+        Assert.Contains("BODY-NEWER-MARKER", capturedUserInput);
+        Assert.Contains("BODY-OLDER-MARKER", capturedUserInput);
+        // Older comes first (chronological order in the user message).
+        var iOlder = capturedUserInput.IndexOf("BODY-OLDER-MARKER", StringComparison.Ordinal);
+        var iNewer = capturedUserInput.IndexOf("BODY-NEWER-MARKER", StringComparison.Ordinal);
+        Assert.True(iOlder < iNewer, "older notification body should appear before newer in BuildAgentInput");
+        // Per-notification headers.
+        Assert.Contains("older issue title", capturedUserInput);
+        Assert.Contains("newer pr title", capturedUserInput);
     }
 
     [Fact]
