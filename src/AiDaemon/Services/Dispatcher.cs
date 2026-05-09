@@ -109,6 +109,16 @@ public class Dispatcher : IDispatcher
             // is just the user's window into the resulting transcript.
             seedSid = Guid.NewGuid().ToString();
 
+            // Persist the sid BEFORE the pre-run. The pre-run's wall-clock budget is 10
+            // minutes and we may edit files in the worktree along the way. If the daemon
+            // is killed mid-pre-run, we don't want the next dispatch to generate a brand
+            // new sid and re-run pre-run on the same worktree with the same instructions
+            // (duplicate edits, lost transcript continuity). With the sid persisted, a
+            // mid-pre-run crash → next dispatch sees rec.SessionId set → skips pre-run
+            // and resumes the same conversation.
+            rec.SessionId = seedSid;
+            await _store.UpsertBranchStateAsync(rec, cancellationToken);
+
             try
             {
                 await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
