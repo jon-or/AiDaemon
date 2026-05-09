@@ -360,12 +360,26 @@ public class RcLauncher : IRcLauncher
             ".claude", "sessions", $"{claudePid}.json");
 
     /// <summary>
-    /// PowerShell + the relay tolerate most strings, but quotes/backticks would break the
-    /// command string we hand to <c>-Command</c>. Strip them.
+    /// Branch names for fork PRs are attacker-controllable, so we use a strict allowlist
+    /// rather than blacklisting the few PowerShell metachars we noticed. Anything outside
+    /// [A-Za-z0-9._+/-] becomes '-'. The set covers every character `git check-ref-format`
+    /// accepts in a normal branch name plus '+' which appears in version-style branches; it
+    /// excludes the shell-special set ($ ` ' " & | ; ( ) { } > < space).
     /// </summary>
-    static string SafeRcName(string branch)
+    internal static string SafeRcName(string branch)
     {
-        var s = branch.Replace("\"", "").Replace("`", "").Replace("$", "").Replace("'", "").Trim();
+        if (string.IsNullOrEmpty(branch))
+            return "ai-daemon";
+
+        var sb = new System.Text.StringBuilder(branch.Length);
+        foreach (var ch in branch)
+        {
+            var ok = ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9')
+                  or '.' or '_' or '+' or '/' or '-';
+            sb.Append(ok ? ch : '-');
+        }
+
+        var s = sb.ToString().Trim('-');
         return string.IsNullOrEmpty(s) ? "ai-daemon" : s;
     }
 
