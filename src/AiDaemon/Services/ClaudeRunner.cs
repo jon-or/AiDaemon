@@ -63,8 +63,10 @@ public class ClaudeRunner : IClaudeRunner
             args.Add(permissionMode);
         }
 
-        args.Add(userInput);
-
+        // Pipe userInput via stdin instead of a trailing positional arg. Windows CreateProcess
+        // has a 32,767-char command line cap; AgentTriage inlines every comment body on the
+        // branch, so a busy PR thread can exceed that. stdin has no such limit and `claude -p`
+        // reads from it whenever no positional prompt is supplied.
         using var perCallCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         perCallCts.CancelAfter(timeout);
 
@@ -75,6 +77,7 @@ public class ClaudeRunner : IClaudeRunner
                 _options.ClaudePath,
                 args,
                 workingDirectory: workingDirectory,
+                stdin: userInput,
                 cancellationToken: perCallCts.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
