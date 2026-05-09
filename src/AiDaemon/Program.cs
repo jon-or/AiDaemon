@@ -68,7 +68,11 @@ builder.Services.AddSingleton<IBranchResolver, BranchResolver>();
 builder.Services.AddSingleton<INotificationPoller, NotificationPoller>();
 builder.Services.AddSingleton<IRcLauncher, RcLauncher>();
 builder.Services.AddSingleton<IAgentPreRunner, AgentPreRunner>();
-builder.Services.AddSingleton<INotificationPusher, NoopNotificationPusher>();
+// AddHttpClient<TInterface, TClient> registers NtfyPusher as transient, but the singleton
+// Dispatcher captures one instance for its lifetime — fine here because the daemon is a
+// worker process where DNS-rotation concerns don't apply, and HttpClientFactory still
+// manages handler pooling.
+builder.Services.AddHttpClient<INotificationPusher, NtfyPusher>();
 builder.Services.AddSingleton<IDispatcher, Dispatcher>();
 
 builder.Services.AddHostedService<Worker>();
