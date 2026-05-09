@@ -167,8 +167,9 @@ public class GhClientTests
         StubGh("<html><body>504 Gateway Time-out</body></html>");
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => Build().ApiAsync<JsonElementBag>("/user", default));
-        // The wrapped JsonException is preserved as InnerException for diagnostics.
-        Assert.IsType<System.Text.Json.JsonException>(ex.InnerException);
+        // The wrapped JsonException is preserved as InnerException for diagnostics
+        // (JsonReaderException : JsonException — accept the base type for forward-compat).
+        Assert.IsAssignableFrom<System.Text.Json.JsonException>(ex.InnerException);
         Assert.Contains("First 200 chars", ex.Message);
     }
 
