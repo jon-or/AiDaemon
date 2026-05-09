@@ -88,7 +88,7 @@ public class Dispatcher : IDispatcher
             {
                 await _launcher.CleanupAsync(rec, cancellationToken);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex, "cleanup threw — proceeding with respawn");
             }
@@ -113,7 +113,7 @@ public class Dispatcher : IDispatcher
             {
                 await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogWarning(ex,
                     "pre-run threw — proceeding to RC anyway sid={Sid} branch={Branch}",
@@ -132,7 +132,7 @@ public class Dispatcher : IDispatcher
         {
             attachment = await _launcher.SpawnRcAsync(branch, seedSid, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid ?? "(fresh)");
             // Persist whatever state we have so the next attempt resumes correctly.
@@ -216,7 +216,7 @@ public class Dispatcher : IDispatcher
                 if (!string.IsNullOrEmpty(rec.Worktree))
                     _fs.DeleteFile(Path.Combine(rec.Worktree, ".daemon-active"));
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogDebug(ex, "marker cleanup on startup for {Worktree} failed (ignored)", rec.Worktree);
             }
@@ -232,7 +232,7 @@ public class Dispatcher : IDispatcher
         {
             await _launcher.CleanupAsync(rec, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "sweep cleanup threw for branch={Branch} reason={Reason}", rec.Branch, reason);
         }

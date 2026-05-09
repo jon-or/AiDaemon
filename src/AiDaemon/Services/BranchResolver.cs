@@ -73,7 +73,7 @@ public class BranchResolver : IBranchResolver
         {
             pr = await _gh.GetPullRequestAsync(n.Repository.FullName, prNumber, cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex,
                 "failed to fetch PR {Repo}#{Pr} thread={ThreadId}",
