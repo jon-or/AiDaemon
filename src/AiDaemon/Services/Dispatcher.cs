@@ -36,8 +36,14 @@ public class Dispatcher : IDispatcher
     }
 
     public async Task<DispatchOutcome> DispatchAsync(
-        BranchInfo branch, GhNotification notification, TriageVerdict verdict, CancellationToken cancellationToken)
+        BranchInfo branch, IReadOnlyList<NotificationWithBody> items, TriageVerdict verdict, CancellationToken cancellationToken)
     {
+        if (items.Count == 0)
+            throw new ArgumentException("Dispatch requires at least one notification.", nameof(items));
+
+        // Use the most-recent notification for any "primary" metadata (push title, etc.).
+        var primary = items.OrderByDescending(i => i.Notification.UpdatedAt).First().Notification;
+
         var key = branch.Key;
         var rec = await _store.GetBranchStateAsync(key, cancellationToken)
             ?? new BranchState
@@ -64,7 +70,7 @@ public class Dispatcher : IDispatcher
         {
             rec.LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
-            await _pusher.PushHeadsUpAsync(rec.RcUrl ?? "", branch, notification, verdict, cancellationToken);
+            await _pusher.PushHeadsUpAsync(rec.RcUrl ?? "", branch, primary, verdict, cancellationToken);
             _logger.LogInformation(
                 "dispatch=heads_up branch={Branch} url={Url}", key, rec.RcUrl);
             return DispatchOutcome.HeadsUp;
@@ -104,7 +110,7 @@ public class Dispatcher : IDispatcher
 
             try
             {
-                await _preRunner.RunAsync(seedSid, branch, notification, verdict, cancellationToken);
+                await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -144,7 +150,7 @@ public class Dispatcher : IDispatcher
         rec.LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         await _store.UpsertBranchStateAsync(rec, cancellationToken);
-        await _pusher.PushSessionLinkAsync(attachment.Url, branch, notification, verdict, cancellationToken);
+        await _pusher.PushSessionLinkAsync(attachment.Url, branch, primary, verdict, cancellationToken);
 
         _logger.LogInformation(
             "dispatch=spawned branch={Branch} sid={Sid} bridge={Bridge} url={Url}",

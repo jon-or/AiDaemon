@@ -13,7 +13,6 @@ public class AgentPreRunner : IAgentPreRunner
     static readonly TimeSpan PreRunTimeout = TimeSpan.FromMinutes(10);
 
     readonly IClaudeRunner _claude;
-    readonly IGhClient _gh;
     readonly DaemonOptions _options;
     readonly ILogger<AgentPreRunner> _logger;
 
@@ -21,12 +20,10 @@ public class AgentPreRunner : IAgentPreRunner
 
     public AgentPreRunner(
         IClaudeRunner claude,
-        IGhClient gh,
         IOptions<DaemonOptions> options,
         ILogger<AgentPreRunner> logger)
     {
         _claude = claude;
-        _gh = gh;
         _options = options.Value;
         _logger = logger;
     }
@@ -34,42 +31,28 @@ public class AgentPreRunner : IAgentPreRunner
     public async Task<bool> RunAsync(
         string sessionId,
         BranchInfo branch,
-        GhNotification n,
+        IReadOnlyList<NotificationWithBody> items,
         TriageVerdict verdict,
         CancellationToken cancellationToken)
     {
-        // Pre-fetch the comment body once so the agent has it inline (no tool round-trip just
-        // to read GitHub).
-        CommentInfo? comment = null;
-        if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
-        {
-            try
-            {
-                comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "pre-run: failed to pre-fetch comment body — agent can fetch via tools");
-            }
-        }
-        var commentBody = comment?.Body ?? "";
+        if (items.Count == 0)
+            throw new ArgumentException("Pre-run requires at least one notification.", nameof(items));
 
-        var userInput = BuildUserInput(n, branch, verdict, commentBody);
+        var userInput = BuildUserInput(branch, items, verdict);
 
         _logger.LogInformation(
-            "pre-run starting sid={Sid} branch={Branch} model={Model}",
-            sessionId, branch.Key, _options.Triage.PreRunModel);
+            "pre-run starting sid={Sid} branch={Branch} model={Model} count={Count}",
+            sessionId, branch.Key, _options.Triage.PreRunModel, items.Count);
 
         try
         {
             // No --json-schema: the pre-run is a free-form agent run that ends with a text
-            // summary the user reads first when they take over. We pass an empty schema string
-            // by using --output-format json without a schema to keep the response wrapper
-            // shape consistent with the triage call site.
+            // summary the user reads first when they take over. We pass a permissive schema
+            // to keep the response wrapper shape consistent with the triage call site.
             var result = await _claude.RunHeadlessJsonAsync(
                 systemPrompt: _systemPrompt.Value,
                 userInput: userInput,
-                schemaJson: "{\"type\":\"object\"}",  // permissive: any object passes
+                schemaJson: "{\"type\":\"object\"}",
                 model: _options.Triage.PreRunModel,
                 workingDirectory: branch.Worktree,
                 timeout: PreRunTimeout,
@@ -82,8 +65,6 @@ public class AgentPreRunner : IAgentPreRunner
                 _logger.LogWarning(
                     "pre-run is_error=true sid={Sid} branch={Branch} result={Result}",
                     sessionId, branch.Key, result.Result);
-                // Still return true — partial progress may have made it to disk and is worth
-                // showing the user.
                 return false;
             }
 
@@ -101,33 +82,46 @@ public class AgentPreRunner : IAgentPreRunner
         }
     }
 
-    static string BuildUserInput(GhNotification n, BranchInfo branch, TriageVerdict verdict, string commentBody)
+    static string BuildUserInput(BranchInfo branch, IReadOnlyList<NotificationWithBody> items, TriageVerdict verdict)
     {
         var sb = new StringBuilder();
-        sb.AppendLine("# GitHub notification — triage classified this as actionable");
-        sb.AppendLine($"- Repository: {n.Repository.FullName}");
-        sb.AppendLine($"- Type: {n.Subject.Type}");
-        sb.AppendLine($"- Reason: {n.Reason}");
-        sb.AppendLine($"- Title: {n.Subject.Title}");
+        sb.AppendLine($"# Branch: {branch.Branch}");
+        sb.AppendLine($"- Repository: {branch.Repo}");
         if (branch.PrNumber is int pr) sb.AppendLine($"- PR: #{pr}");
         if (branch.IssueNumber is int issue) sb.AppendLine($"- Issue: #{issue}");
-        sb.AppendLine($"- Branch: {branch.Branch}");
         sb.AppendLine($"- Worktree (your cwd): {branch.Worktree}");
-        if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
-            sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
-
         sb.AppendLine();
+
         sb.AppendLine("## Triage verdict");
         sb.AppendLine();
         sb.AppendLine($"- summary: {verdict.Summary}");
         sb.AppendLine($"- why: {verdict.Why}");
+        sb.AppendLine();
 
-        if (!string.IsNullOrEmpty(commentBody))
+        if (items.Count == 1)
+            sb.AppendLine("## Notification");
+        else
+            sb.AppendLine($"## {items.Count} notifications on this branch");
+
+        var ordered = items.OrderBy(i => i.Notification.UpdatedAt).ToList();
+        for (var i = 0; i < ordered.Count; i++)
         {
+            var n = ordered[i].Notification;
+            var body = ordered[i].CommentBody;
+
             sb.AppendLine();
-            sb.AppendLine("## Comment body");
-            sb.AppendLine();
-            sb.AppendLine(commentBody);
+            sb.AppendLine($"### {i + 1}. {n.Subject.Type} — reason `{n.Reason}` — {n.UpdatedAt:O}");
+            sb.AppendLine($"- Title: {n.Subject.Title}");
+            if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
+                sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
+
+            if (!string.IsNullOrEmpty(body))
+            {
+                sb.AppendLine();
+                sb.AppendLine("```");
+                sb.AppendLine(body);
+                sb.AppendLine("```");
+            }
         }
 
         sb.AppendLine();

@@ -61,16 +61,17 @@ public class TriagePipeline : ITriagePipeline
         _botBlocklist = new HashSet<string>(_options.BotAuthorBlocklist, StringComparer.OrdinalIgnoreCase);
     }
 
-    public async Task<TriageVerdict?> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
+    public async Task<(TriageVerdict? Verdict, string CommentBody)> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
     {
         // ---------- L1: author / type / reason / rate ----------
         if (!SupportedSubjectTypes.Contains(n.Subject.Type))
-            return TriageVerdict.Drop($"unsupported subject type: {n.Subject.Type}");
+            return (TriageVerdict.Drop($"unsupported subject type: {n.Subject.Type}"), "");
 
         if (!_actionableReasons.Contains(n.Reason))
-            return TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons");
+            return (TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons"), "");
 
-        // L1 author check requires the comment body. Fetch once and reuse for L2 below.
+        // L1 author check requires the comment body. Fetch once; the body is also returned
+        // so callers can pass it through to the agent without re-fetching the same URL.
         CommentInfo? comment = null;
         if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
             comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
@@ -80,10 +81,10 @@ public class TriagePipeline : ITriagePipeline
 
         if (!string.IsNullOrEmpty(_options.AiUserLogin) &&
             string.Equals(author, _options.AiUserLogin, StringComparison.OrdinalIgnoreCase))
-            return TriageVerdict.Drop($"self-authored by {author}");
+            return (TriageVerdict.Drop($"self-authored by {author}"), body);
 
         if (!string.IsNullOrEmpty(author) && _botBlocklist.Contains(author))
-            return TriageVerdict.Drop($"blocklisted bot author: {author}");
+            return (TriageVerdict.Drop($"blocklisted bot author: {author}"), body);
 
         // Rate-limit check is the last L1 step so we don't burn budget on notifications that
         // would have been dropped above.
@@ -94,8 +95,8 @@ public class TriagePipeline : ITriagePipeline
             _logger.LogInformation(
                 "rate-limit drop thread={ThreadId} count={Count} max={Max}",
                 n.Id, newCount, _options.Triage.MaxActionsPerThreadPerDay);
-            return TriageVerdict.Drop(
-                $"thread daily rate limit ({newCount}/{_options.Triage.MaxActionsPerThreadPerDay})");
+            return (TriageVerdict.Drop(
+                $"thread daily rate limit ({newCount}/{_options.Triage.MaxActionsPerThreadPerDay})"), body);
         }
 
         // ---------- L2: regex content filter ----------
@@ -103,36 +104,27 @@ public class TriagePipeline : ITriagePipeline
         foreach (var pat in _l2Patterns.Value)
         {
             if (pat.IsMatch(stripped))
-                return TriageVerdict.Drop($"L2 regex match: /{pat}/");
+                return (TriageVerdict.Drop($"L2 regex match: /{pat}/"), body);
         }
 
         // Defer to agent triage.
-        return null;
+        return (null, body);
     }
 
-    public async Task<TriageVerdict> AgentTriageAsync(GhNotification n, BranchInfo branch, CancellationToken cancellationToken)
+    public async Task<TriageVerdict> AgentTriageAsync(IReadOnlyList<NotificationWithBody> items, BranchInfo branch, CancellationToken cancellationToken)
     {
+        if (items.Count == 0)
+            throw new ArgumentException("AgentTriage requires at least one notification.", nameof(items));
+
         // Triage runs in a stable scratch cwd (NOT the worktree) so claude doesn't pay the
         // CLAUDE.md auto-discovery + plugin sync cost on every notification. Reusing the same
         // scratch dir across calls also keeps the prompt cache warm.
         var scratchDir = Path.Combine(_options.DataDir, "triage-scratch");
 
-        // Fetch the comment body inline so the classifier doesn't need a tool round-trip.
-        CommentInfo? comment = null;
-        if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
-        {
-            try
-            {
-                comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "agent triage: failed to pre-fetch comment body");
-            }
-        }
-        var commentBody = comment?.Body ?? "";
+        var userInput = BuildAgentInput(items, branch);
 
-        var userInput = BuildAgentInput(n, branch, commentBody);
+        // Use the most-recent notification's title for fallback summary text.
+        var primary = items.OrderByDescending(i => i.Notification.UpdatedAt).First();
 
         ClaudeJsonResult result;
         try
@@ -151,22 +143,22 @@ public class TriagePipeline : ITriagePipeline
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "agent triage failed thread={ThreadId} branch={Branch} — defaulting to actionable",
-                n.Id, branch.Key);
+                "agent triage failed branch={Branch} count={Count} — defaulting to actionable",
+                branch.Key, items.Count);
             return TriageVerdict.Actionable(
                 $"agent error ({ex.GetType().Name}) — actionable by default",
-                summary: TruncateSummary(n.Subject.Title),
+                summary: TruncateSummary(primary.Notification.Subject.Title),
                 confidence: 0.5);
         }
 
         if (result.IsError)
         {
             _logger.LogWarning(
-                "agent triage is_error=true thread={ThreadId} branch={Branch} result={Result} — defaulting to actionable",
-                n.Id, branch.Key, result.Result);
+                "agent triage is_error=true branch={Branch} count={Count} result={Result} — defaulting to actionable",
+                branch.Key, items.Count, result.Result);
             return TriageVerdict.Actionable(
                 "agent reported is_error=true — actionable by default",
-                summary: TruncateSummary(n.Subject.Title),
+                summary: TruncateSummary(primary.Notification.Subject.Title),
                 confidence: 0.5);
         }
 
@@ -179,17 +171,17 @@ public class TriagePipeline : ITriagePipeline
             }
             catch (JsonException ex)
             {
-                _logger.LogWarning(ex, "agent triage produced unparseable structured_output thread={ThreadId}", n.Id);
+                _logger.LogWarning(ex, "agent triage produced unparseable structured_output branch={Branch}", branch.Key);
             }
         }
 
         if (llm == null)
         {
             _logger.LogWarning(
-                "agent triage returned no structured output thread={ThreadId} — defaulting to actionable", n.Id);
+                "agent triage returned no structured output branch={Branch} — defaulting to actionable", branch.Key);
             return TriageVerdict.Actionable(
                 "agent returned no structured output — actionable by default",
-                summary: TruncateSummary(n.Subject.Title),
+                summary: TruncateSummary(primary.Notification.Subject.Title),
                 confidence: 0.5);
         }
 
@@ -201,40 +193,55 @@ public class TriagePipeline : ITriagePipeline
         var verdict = new TriageVerdict(action, llm.Why, llm.Summary, llm.Confidence);
 
         _logger.LogInformation(
-            "L3 verdict thread={ThreadId} branch={Branch} action={Action} confidence={Confidence:F2} why={Why}",
-            n.Id, branch.Key, verdict.Action, verdict.Confidence, verdict.Why);
+            "L3 verdict branch={Branch} count={Count} action={Action} confidence={Confidence:F2} why={Why}",
+            branch.Key, items.Count, verdict.Action, verdict.Confidence, verdict.Why);
 
         return verdict;
     }
 
-    /// <summary>The user message the agent receives. Includes everything it needs to investigate.</summary>
-    static string BuildAgentInput(GhNotification n, BranchInfo branch, string commentBody)
+    /// <summary>
+    /// The user message the agent receives. When multiple notifications resolved to the same
+    /// branch (e.g. an issue mention + a PR review on the PR closing it), all of them are
+    /// included so the classifier can weigh them together.
+    /// </summary>
+    static string BuildAgentInput(IReadOnlyList<NotificationWithBody> items, BranchInfo branch)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# GitHub notification");
-        sb.AppendLine($"- Repository: {n.Repository.FullName}");
-        sb.AppendLine($"- Type: {n.Subject.Type}");
-        sb.AppendLine($"- Reason: {n.Reason}");
-        sb.AppendLine($"- Title: {n.Subject.Title}");
+        sb.AppendLine($"# Branch: {branch.Branch}");
+        sb.AppendLine($"- Repository: {branch.Repo}");
         if (branch.PrNumber is int pr) sb.AppendLine($"- PR: #{pr}");
         if (branch.IssueNumber is int issue) sb.AppendLine($"- Issue: #{issue}");
-        sb.AppendLine($"- Branch: {branch.Branch}");
-        sb.AppendLine($"- Worktree (your cwd): {branch.Worktree}");
-        if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
-        {
-            sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
-        }
+        sb.AppendLine();
 
-        if (!string.IsNullOrEmpty(commentBody))
+        if (items.Count == 1)
+            sb.AppendLine("## Notification");
+        else
+            sb.AppendLine($"## {items.Count} notifications on this branch in the current poll");
+
+        // Order by updated_at so the agent reads them in the order they fired.
+        var ordered = items.OrderBy(i => i.Notification.UpdatedAt).ToList();
+        for (var i = 0; i < ordered.Count; i++)
         {
+            var n = ordered[i].Notification;
+            var body = ordered[i].CommentBody;
+
             sb.AppendLine();
-            sb.AppendLine("## Comment body");
-            sb.AppendLine();
-            sb.AppendLine(commentBody);
+            sb.AppendLine($"### {i + 1}. {n.Subject.Type} — reason `{n.Reason}` — {n.UpdatedAt:O}");
+            sb.AppendLine($"- Title: {n.Subject.Title}");
+            if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
+                sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
+
+            if (!string.IsNullOrEmpty(body))
+            {
+                sb.AppendLine();
+                sb.AppendLine("```");
+                sb.AppendLine(body);
+                sb.AppendLine("```");
+            }
         }
 
         sb.AppendLine();
-        sb.AppendLine("Triage this notification per your system prompt. If actionable, do meaningful prep using your tools, then return the JSON verdict.");
+        sb.AppendLine("Classify this branch's notifications per your system prompt and return the JSON verdict.");
         return sb.ToString();
     }
 

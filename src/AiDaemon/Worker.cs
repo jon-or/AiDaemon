@@ -141,11 +141,12 @@ public class Worker : BackgroundService
         var actionable = 0;
         var coalesced = 0;
 
-        // Branches we've already dispatched (or run agent triage for) this tick. A second
-        // notification on the same branch within one poll gets logged + recorded but doesn't
-        // re-fire the agent-triage / dispatch path. Cross-tick reuse is handled by the
-        // branches table's RcActive state via the dispatcher.
-        var dispatchedThisTick = new HashSet<string>(StringComparer.Ordinal);
+        // ============================================================================
+        // Pass 1: poll every notification, run cheap L1+L2 filters, resolve to a branch,
+        // group survivors by branch.Key. Notifications that drop or fail to resolve are
+        // marked here and never reach pass 2.
+        // ============================================================================
+        var byBranch = new Dictionary<string, BranchBatch>(StringComparer.Ordinal);
 
         await foreach (var n in _poller.PollAsync(cancellationToken))
         {
@@ -156,11 +157,13 @@ public class Worker : BackgroundService
                 "notification thread={ThreadId} repo={Repo} type={Type} reason={Reason} title={Title}",
                 n.Id, n.Repository.FullName, n.Subject.Type, n.Reason, n.Subject.Title);
 
-            // ---------- L1 + L2: cheap deterministic filters ----------
+            // L1+L2. Returns a verdict + the comment body we fetched (so pass 2 doesn't
+            // re-fetch).
             TriageVerdict? quick;
+            string commentBody;
             try
             {
-                quick = await _triage.QuickTriageAsync(n, cancellationToken);
+                (quick, commentBody) = await _triage.QuickTriageAsync(n, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -178,7 +181,6 @@ public class Worker : BackgroundService
                 continue;
             }
 
-            // ---------- Resolve branch (needed for agent triage AND dispatch) ----------
             BranchInfo? branch = null;
             try
             {
@@ -199,82 +201,121 @@ public class Worker : BackgroundService
                 "resolved thread={ThreadId} branch={Branch} worktree={Worktree} pr={Pr} issue={Issue}",
                 n.Id, branch.Branch, branch.Worktree, branch.PrNumber, branch.IssueNumber);
 
-            // ---------- Within-tick coalesce: only one agent run + dispatch per branch ----------
-            if (!dispatchedThisTick.Add(branch.Key))
+            if (!byBranch.TryGetValue(branch.Key, out var batch))
             {
-                coalesced++;
-                _logger.LogInformation(
-                    "coalesced thread={ThreadId} branch={Branch} (already dispatched this tick)",
-                    n.Id, branch.Key);
-                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"coalesced:{branch.Key}", cancellationToken);
-                continue;
+                batch = new BranchBatch(branch);
+                byBranch[branch.Key] = batch;
             }
 
-            // ---------- L3: agent triage (and the actual research/fix work) in the worktree ----------
+            batch.Items.Add(new NotificationWithBody(n, commentBody));
+            batch.QuickShortcut ??= quick;  // remember any L1 shortcut-actionable for pass 2
+        }
+
+        // ============================================================================
+        // Pass 2: one agent triage + one dispatch per branch, no matter how many
+        // notifications it covers. The agent sees every notification's body inline so
+        // it can weigh related events together.
+        // ============================================================================
+        foreach (var (branchKey, batch) in byBranch)
+        {
+            var primaryNotificationId = batch.PrimaryNotificationId;
+            var commentIds = batch.Items.Select(i => NotificationPoller.DeriveCommentId(i.Notification)).ToList();
+
+            // ---------- L3 agent triage in scratch ----------
             TriageVerdict verdict;
-            if (quick is { Action: TriageAction.Actionable })
+            if (batch.QuickShortcut is { Action: TriageAction.Actionable } shortcut)
             {
-                // Quick triage produced a definitive actionable (e.g. a future shortcut). Treat
-                // it as final, with no agent session. The dispatcher will fresh-spawn RC.
-                verdict = quick;
+                verdict = shortcut;
             }
             else
             {
                 try
                 {
-                    verdict = await _triage.AgentTriageAsync(n, branch, cancellationToken);
+                    verdict = await _triage.AgentTriageAsync(batch.Items, batch.Branch, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "agent triage threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
-                    await _stateStore.MarkProcessedAsync(n.Id, commentId, $"failed:agent-triage:{branch.Key}", cancellationToken);
+                    _logger.LogError(ex,
+                        "agent triage threw branch={Branch} count={Count}",
+                        branchKey, batch.Items.Count);
+                    await MarkAllAsync(batch, $"failed:agent-triage:{branchKey}", cancellationToken);
                     continue;
                 }
             }
 
-            string outcome;
             if (verdict.Action == TriageAction.Drop)
             {
-                dropped++;
+                dropped += batch.Items.Count;
                 _logger.LogInformation(
-                    "verdict thread={ThreadId} action=Drop why={Why} (L3)",
-                    n.Id, verdict.Why);
-                outcome = $"dropped:{verdict.Why}";
+                    "verdict branch={Branch} count={Count} action=Drop why={Why} (L3)",
+                    branchKey, batch.Items.Count, verdict.Why);
+                await MarkAllAsync(batch, $"dropped:{verdict.Why}", cancellationToken);
+                continue;
             }
-            else
+
+            actionable++;                       // count once per branch — the unit of dispatch
+            coalesced += batch.Items.Count - 1; // any extras on the same branch were absorbed
+            _logger.LogInformation(
+                "verdict branch={Branch} count={Count} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
+                branchKey, batch.Items.Count, verdict.Summary, verdict.Why, verdict.Confidence);
+
+            DispatchOutcome dispatchOutcome;
+            try
             {
-                actionable++;
-                _logger.LogInformation(
-                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
-                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence);
-
-                DispatchOutcome dispatchOutcome;
-                try
-                {
-                    dispatchOutcome = await _dispatcher.DispatchAsync(branch, n, verdict, cancellationToken);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "dispatch threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
-                    dispatchOutcome = DispatchOutcome.Failed;
-                }
-
-                outcome = dispatchOutcome switch
-                {
-                    DispatchOutcome.Spawned => $"spawned:{branch.Key}",
-                    DispatchOutcome.HeadsUp => $"heads_up:{branch.Key}",
-                    _ => $"failed:{branch.Key}",
-                };
+                dispatchOutcome = await _dispatcher.DispatchAsync(batch.Branch, batch.Items, verdict, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "dispatch threw branch={Branch}", branchKey);
+                dispatchOutcome = DispatchOutcome.Failed;
             }
 
-            await _stateStore.MarkProcessedAsync(n.Id, commentId, outcome, cancellationToken);
+            var outcome = dispatchOutcome switch
+            {
+                DispatchOutcome.Spawned => $"spawned:{branchKey}",
+                DispatchOutcome.HeadsUp => $"heads_up:{branchKey}",
+                _ => $"failed:{branchKey}",
+            };
+            await MarkAllAsync(batch, outcome, cancellationToken);
         }
 
         if (seen > 0)
             _logger.LogInformation(
                 "tick seen={Seen} dropped={Dropped} actionable={Actionable} coalesced={Coalesced} branches={Branches}",
-                seen, dropped, actionable, coalesced, dispatchedThisTick.Count);
+                seen, dropped, actionable, coalesced, byBranch.Count);
         else
             _logger.LogDebug("tick (no new notifications)");
+    }
+
+    async Task MarkAllAsync(BranchBatch batch, string outcome, CancellationToken cancellationToken)
+    {
+        foreach (var item in batch.Items)
+        {
+            var commentId = NotificationPoller.DeriveCommentId(item.Notification);
+            await _stateStore.MarkProcessedAsync(item.Notification.Id, commentId, outcome, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Per-branch buffer accumulated during pass 1 of <see cref="TickAsync"/>. Each branch
+    /// produces exactly one agent triage and at most one dispatch in pass 2.
+    /// </summary>
+    sealed class BranchBatch
+    {
+        public BranchInfo Branch { get; }
+        public List<NotificationWithBody> Items { get; } = new();
+
+        /// <summary>
+        /// First non-null actionable verdict produced by L1 (e.g. a future short-circuit).
+        /// Pass 2 prefers this over running L3 when present.
+        /// </summary>
+        public TriageVerdict? QuickShortcut { get; set; }
+
+        public BranchBatch(BranchInfo branch) { Branch = branch; }
+
+        /// <summary>The id of the most recent notification in the batch (by updated_at).</summary>
+        public string PrimaryNotificationId => Items
+            .OrderByDescending(i => i.Notification.UpdatedAt)
+            .First().Notification.Id;
     }
 }

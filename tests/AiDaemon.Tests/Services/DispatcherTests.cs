@@ -45,7 +45,7 @@ public class DispatcherTests : IDisposable
         _preRunner.Setup(p => p.RunAsync(
                 It.IsAny<string>(),
                 It.IsAny<BranchInfo>(),
-                It.IsAny<GhNotification>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(),
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
@@ -84,16 +84,16 @@ public class DispatcherTests : IDisposable
         string? capturedPreRunSid = null;
         string? capturedSpawnSid = null;
 
-        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch, It.IsAny<GhNotification>(),
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch, It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
-            .Callback((string sid, BranchInfo _, GhNotification _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
+            .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
             .ReturnsAsync(true);
 
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
             .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
 
-        var outcome = await Build().DispatchAsync(branch, N(), V(), default);
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
         Assert.Equal(DispatchOutcome.Spawned, outcome);
         Assert.NotNull(capturedPreRunSid);
@@ -139,7 +139,7 @@ public class DispatcherTests : IDisposable
 
         _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(true);
 
-        var outcome = await Build().DispatchAsync(branch, N(), V(), default);
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
         Assert.Equal(DispatchOutcome.HeadsUp, outcome);
         _launcher.Verify(l => l.SpawnRcAsync(It.IsAny<BranchInfo>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
@@ -180,7 +180,7 @@ public class DispatcherTests : IDisposable
             .ReturnsAsync(Att(psPid: 9999, claudePid: 8888, startTicks: 2_000_000_000_000L,
                 bridge: "session_NEW", url: "https://claude.ai/code/session_NEW", sessionId: sid));
 
-        var outcome = await Build().DispatchAsync(branch, N(), V(), default);
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
         Assert.Equal(DispatchOutcome.Spawned, outcome);
         _launcher.Verify(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>()), Times.Once);
@@ -202,7 +202,7 @@ public class DispatcherTests : IDisposable
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new TimeoutException("PowerShell never spawned claude.exe"));
 
-        var outcome = await Build().DispatchAsync(branch, N(), V(), default);
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
         Assert.Equal(DispatchOutcome.Failed, outcome);
         _pusher.Verify(p => p.PushSessionLinkAsync(

@@ -107,26 +107,37 @@ public class TriagePipelineTests : IDisposable
     [Fact]
     public async Task Quick_DropsUnsupportedSubjectType()
     {
-        var v = await _pipeline.QuickTriageAsync(N(type: "CheckSuite"), default);
+        var (v, body) = await _pipeline.QuickTriageAsync(N(type: "CheckSuite"), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("unsupported subject type", v.Why);
+        Assert.Equal("", body);  // L1 short-circuit, no body fetched
     }
 
     [Fact]
     public async Task Quick_DropsReasonNotInActionableList()
     {
-        var v = await _pipeline.QuickTriageAsync(N(reason: "subscribed"), default);
+        var (v, _) = await _pipeline.QuickTriageAsync(N(reason: "subscribed"), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("ActionableReasons", v.Why);
     }
 
     [Fact]
+    public async Task Quick_ReturnsBodyAlongsideVerdict_OnBotDrop()
+    {
+        StubComment("any body", author: "dependabot[bot]");
+        var (v, body) = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
+        Assert.Equal("any body", body);  // body fetched + returned even on bot-drop
+    }
+
+    [Fact]
     public async Task Quick_DropsSelfAuthored()
     {
         StubComment("any body", author: "jon-or-ai");
-        var v = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("self-authored", v.Why);
@@ -136,7 +147,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_DropsBotAuthor()
     {
         StubComment("any body", author: "dependabot[bot]");
-        var v = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("blocklisted bot author", v.Why);
@@ -149,12 +160,12 @@ public class TriagePipelineTests : IDisposable
 
         for (var i = 0; i < _options.Triage.MaxActionsPerThreadPerDay; i++)
         {
-            var ok = await _pipeline.QuickTriageAsync(N(), default);
+            var (ok, _) = await _pipeline.QuickTriageAsync(N(), default);
             // Under the cap and past L2 → null (continue to L3).
             Assert.Null(ok);
         }
 
-        var capped = await _pipeline.QuickTriageAsync(N(), default);
+        var (capped, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(capped);
         Assert.Equal(TriageAction.Drop, capped!.Action);
         Assert.Contains("rate limit", capped.Why, StringComparison.OrdinalIgnoreCase);
@@ -169,7 +180,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_DropsNoiseRegex(string body)
     {
         StubComment(body);
-        var v = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
@@ -180,19 +191,20 @@ public class TriagePipelineTests : IDisposable
     {
         var body = "> earlier text\n> more quoted text\n\nlgtm";
         StubComment(body);
-        var v = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
     }
 
     [Fact]
-    public async Task Quick_ReturnsNull_WhenL1AndL2DontDecide()
+    public async Task Quick_ReturnsNullWithBody_WhenL1AndL2DontDecide()
     {
         // Real, substantive comment body that isn't noise — should bubble up to L3.
         StubComment("can you bump the timeout in foo.cs to 30s?");
-        var v = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, body) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.Null(v);
+        Assert.Equal("can you bump the timeout in foo.cs to 30s?", body);
     }
 
     [Fact]
@@ -216,7 +228,7 @@ public class TriagePipelineTests : IDisposable
     {
         StubAgent("actionable", 0.95);
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
 
@@ -239,7 +251,7 @@ public class TriagePipelineTests : IDisposable
     {
         StubAgent("drop", 0.95, why: "status update");
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Drop, v.Action);
         Assert.Equal("status update", v.Why);
@@ -251,7 +263,7 @@ public class TriagePipelineTests : IDisposable
         // No bias rule — the LLM's verdict is taken directly.
         StubAgent("drop", 0.6, why: "borderline");
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Drop, v.Action);
     }
@@ -261,7 +273,7 @@ public class TriagePipelineTests : IDisposable
     {
         StubAgent("actionable", 0.4, why: "needs review");
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
         Assert.Equal("needs review", v.Why);
@@ -277,7 +289,7 @@ public class TriagePipelineTests : IDisposable
                 It.IsAny<string?>(), It.IsAny<string?>()))
             .ThrowsAsync(new TimeoutException("test"));
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
         Assert.Contains("agent error", v.Why);
@@ -293,7 +305,7 @@ public class TriagePipelineTests : IDisposable
                 It.IsAny<string?>(), It.IsAny<string?>()))
             .ReturnsAsync(new ClaudeJsonResult(true, "Not logged in", null, null, 50));
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
     }
@@ -308,7 +320,7 @@ public class TriagePipelineTests : IDisposable
                 It.IsAny<string?>(), It.IsAny<string?>()))
             .ReturnsAsync(new ClaudeJsonResult(false, "", null, "end_turn", 50));
 
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+        var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
     }

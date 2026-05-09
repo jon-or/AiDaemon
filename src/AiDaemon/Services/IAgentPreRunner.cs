@@ -11,6 +11,9 @@ public interface IAgentPreRunner
     /// returns successfully, the session JSONL contains the agent's transcript and is ready
     /// to be resumed under Remote Control by the user.
     /// </summary>
+    /// <param name="items">All notifications that resolved to this branch in the current poll
+    /// (e.g. an issue mention + a related PR review). The agent sees every one in its user
+    /// message so it has full context for the prep work.</param>
     /// <returns>
     /// True on success (session ready to resume), false if the run failed and the caller
     /// should still spawn RC (the user inherits whatever partial progress made it to disk).
@@ -18,7 +21,7 @@ public interface IAgentPreRunner
     Task<bool> RunAsync(
         string sessionId,
         BranchInfo branch,
-        GhNotification notification,
+        IReadOnlyList<NotificationWithBody> items,
         TriageVerdict verdict,
         CancellationToken cancellationToken);
 }

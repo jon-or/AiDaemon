@@ -5,13 +5,16 @@ namespace AiDaemon.Services;
 public interface IDispatcher
 {
     /// <summary>
-    /// Routes an actionable verdict to either a fresh RC spawn (with session-link push) or a
-    /// heads-up push against an existing live session. Idempotent across ticks via the branches
-    /// state table; the within-tick coalescing happens in the worker.
+    /// Routes an actionable verdict to either a fresh RC spawn (preceded by the headless
+    /// pre-run agent) or a heads-up push against an existing live session. Idempotent across
+    /// ticks via the branches state table; the within-tick coalescing happens in the worker.
     /// </summary>
+    /// <param name="items">All notifications that resolved to this branch in the current poll.
+    /// The pre-run agent and the push pusher both receive the full list; the dispatcher's
+    /// branch-state bookkeeping uses the most-recent notification for "primary" metadata.</param>
     Task<DispatchOutcome> DispatchAsync(
         BranchInfo branch,
-        GhNotification notification,
+        IReadOnlyList<NotificationWithBody> items,
         TriageVerdict verdict,
         CancellationToken cancellationToken);
 
