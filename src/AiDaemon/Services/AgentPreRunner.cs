@@ -73,12 +73,7 @@ public class AgentPreRunner : IAgentPreRunner
                 sessionId, branch.Key, result.DurationMs);
             return true;
         }
-        catch (OperationCanceledException)
-        {
-            // Daemon is shutting down — let the dispatcher abort the whole flow.
-            throw;
-        }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex,
                 "pre-run threw sid={Sid} branch={Branch} — proceeding to RC anyway",

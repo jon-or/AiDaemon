@@ -35,4 +35,8 @@
     <EmbeddedResource Include="Triage\schema.json" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AiDaemon.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -1,3 +1,4 @@
+using System.Text;
 using AiDaemon.Configuration;
 using AiDaemon.Io;
 using AiDaemon.Models;
@@ -183,14 +184,19 @@ public class Dispatcher : IDispatcher
             }
 
             // Case 2: idle timeout — JSONL untouched for > RcIdleTimeoutHours.
-            if (TryGetJsonlPath(rec, out var jsonlPath)
-                && _fs.FileExists(jsonlPath)
-                && _fs.GetLastWriteTimeUtc(jsonlPath) < idleThreshold)
+            // Skip if the JSONL is missing (fresh spawn that hasn't flushed yet) — File's
+            // sentinel for that is 1601-01-01 UTC, well before any reasonable idleThreshold,
+            // and we don't want to reap a session that simply hasn't written its first turn.
+            if (TryGetJsonlPath(rec, out var jsonlPath) && _fs.FileExists(jsonlPath))
             {
-                _logger.LogInformation(
-                    "sweep: reaping idle RC branch={Branch} jsonl_mtime={Mtime:O} (>{Hours}h since last activity)",
-                    rec.Branch, _fs.GetLastWriteTimeUtc(jsonlPath), idleTimeout.TotalHours);
-                await ReapAsync(rec, "idle-timeout", cancellationToken);
+                var mtime = _fs.GetLastWriteTimeUtc(jsonlPath);
+                if (mtime < idleThreshold)
+                {
+                    _logger.LogInformation(
+                        "sweep: reaping idle RC branch={Branch} jsonl_mtime={Mtime:O} (>{Hours}h since last activity)",
+                        rec.Branch, mtime, idleTimeout.TotalHours);
+                    await ReapAsync(rec, "idle-timeout", cancellationToken);
+                }
             }
         }
     }
@@ -270,9 +276,9 @@ public class Dispatcher : IDispatcher
     /// <c>orez.worktrees</c>) and other punctuation are also replaced — get this wrong and
     /// the idle-timeout sweep can never find the JSONL.
     /// </summary>
-    public static string EncodeWorktreeAsProjectDir(string worktreePath)
+    internal static string EncodeWorktreeAsProjectDir(string worktreePath)
     {
-        var sb = new System.Text.StringBuilder(worktreePath.Length);
+        var sb = new StringBuilder(worktreePath.Length);
         foreach (var ch in worktreePath)
         {
             if (ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-')
