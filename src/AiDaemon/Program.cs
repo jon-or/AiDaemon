@@ -1,5 +1,6 @@
 using AiDaemon;
 using AiDaemon.Configuration;
+using AiDaemon.Io;
 using AiDaemon.Process;
 using AiDaemon.Services;
 using AiDaemon.Storage;
@@ -55,11 +56,13 @@ builder.Services.AddSerilog((sp, lc) => lc
         retainedFileCountLimit: 14,
         shared: false));
 
+builder.Services.AddSingleton<IFileSystem, FileSystem>();
 builder.Services.AddSingleton<IProcessRunner, ProcessRunner>();
 builder.Services.AddSingleton<IStateStore, SqliteStateStore>();
 builder.Services.AddSingleton<IGhClient, GhClient>();
 builder.Services.AddSingleton<IClaudeRunner, ClaudeRunner>();
 builder.Services.AddSingleton<ITriagePipeline, TriagePipeline>();
+builder.Services.AddSingleton<IBranchResolver, BranchResolver>();
 builder.Services.AddSingleton<INotificationPoller, NotificationPoller>();
 
 builder.Services.AddHostedService<Worker>();

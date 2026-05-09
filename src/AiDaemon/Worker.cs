@@ -14,6 +14,7 @@ public class Worker : BackgroundService
     readonly IStateStore _stateStore;
     readonly INotificationPoller _poller;
     readonly ITriagePipeline _triage;
+    readonly IBranchResolver _resolver;
 
     Mutex? _instanceMutex;
 
@@ -23,7 +24,8 @@ public class Worker : BackgroundService
         IHostApplicationLifetime lifetime,
         IStateStore stateStore,
         INotificationPoller poller,
-        ITriagePipeline triage)
+        ITriagePipeline triage,
+        IBranchResolver resolver)
     {
         _logger = logger;
         _options = options;
@@ -31,6 +33,7 @@ public class Worker : BackgroundService
         _stateStore = stateStore;
         _poller = poller;
         _triage = triage;
+        _resolver = resolver;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -147,11 +150,32 @@ public class Worker : BackgroundService
             else
             {
                 actionable++;
-                outcome = "actionable";
-                // Phase 4 will spawn an RC session here. For now, just log.
                 _logger.LogInformation(
                     "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
                     n.Id, verdict.Summary, verdict.Why, verdict.Confidence);
+
+                BranchInfo? branch = null;
+                try
+                {
+                    branch = await _resolver.ResolveAsync(n, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
+                }
+
+                if (branch == null)
+                {
+                    outcome = "actionable:unresolved";
+                }
+                else
+                {
+                    outcome = $"actionable:{branch.Key}";
+                    _logger.LogInformation(
+                        "resolved thread={ThreadId} branch={Branch} worktree={Worktree} pr={Pr} issue={Issue}",
+                        n.Id, branch.Branch, branch.Worktree, branch.PrNumber, branch.IssueNumber);
+                    // Phase 4 will dispatch an RC session here.
+                }
             }
 
             await _stateStore.MarkProcessedAsync(n.Id, commentId, outcome, cancellationToken);
