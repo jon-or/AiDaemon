@@ -187,7 +187,13 @@ public class Worker : BackgroundService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex, "quick triage threw thread={ThreadId} — skipping", n.Id);
+                // The poller has already advanced its in-memory cursor past this notification.
+                // If we just `continue` without recording an outcome, the row is silently lost
+                // forever. Mark it processed with a failure-flavored outcome so the dedupe
+                // table reflects what happened and an operator can see the trail in SQLite.
+                _logger.LogError(ex, "quick triage threw thread={ThreadId} — marking failed", n.Id);
+                failed++;
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"failed:quick-triage:{ex.GetType().Name}", cancellationToken);
                 continue;
             }
 
@@ -202,6 +208,7 @@ public class Worker : BackgroundService
             }
 
             BranchInfo? branch = null;
+            string? resolveOutcome = null;
             try
             {
                 branch = await _resolver.ResolveAsync(n, cancellationToken);
@@ -209,11 +216,13 @@ public class Worker : BackgroundService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
+                failed++;
+                resolveOutcome = $"failed:resolve:{ex.GetType().Name}";
             }
 
             if (branch == null)
             {
-                await _stateStore.MarkProcessedAsync(n.Id, commentId, "unresolved", cancellationToken);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, resolveOutcome ?? "unresolved", cancellationToken);
                 continue;
             }
 
