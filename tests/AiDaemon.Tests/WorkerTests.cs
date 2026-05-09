@@ -22,6 +22,7 @@ public class WorkerTests
     readonly Mock<IBranchResolver> _resolver = new(MockBehavior.Strict);
     readonly Mock<IDispatcher> _dispatcher = new(MockBehavior.Strict);
     readonly Mock<IStateStore> _store = new(MockBehavior.Strict);
+    readonly Mock<IGhClient> _gh = new(MockBehavior.Strict);
     readonly Mock<IHostApplicationLifetime> _lifetime = new();
     readonly DaemonOptions _options = new()
     {
@@ -47,7 +48,8 @@ public class WorkerTests
             _poller.Object,
             _triage.Object,
             _resolver.Object,
-            _dispatcher.Object);
+            _dispatcher.Object,
+            _gh.Object);
     }
 
     static GhNotification N(string id, string commentUrl, DateTimeOffset? updated = null) => new()
@@ -335,7 +337,7 @@ public class WorkerTests
         // Build manually so the default GetKv setup in Build() doesn't override ours.
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
 
         await w.TickAsync(default);
 
@@ -357,7 +359,7 @@ public class WorkerTests
 
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
 
         await w.TickAsync(default);
 
@@ -384,7 +386,7 @@ public class WorkerTests
 
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
 
         // Should not throw — the catch in TryPruneProcessedAsync swallows non-OCE.
         await w.TickAsync(default);

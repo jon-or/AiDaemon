@@ -17,6 +17,7 @@ public class Worker : BackgroundService
     readonly ITriagePipeline _triage;
     readonly IBranchResolver _resolver;
     readonly IDispatcher _dispatcher;
+    readonly IGhClient _gh;
 
     /// <summary>
     /// Single-instance lock. We use an exclusive file handle (FileShare.None) instead of a
@@ -36,7 +37,8 @@ public class Worker : BackgroundService
         INotificationPoller poller,
         ITriagePipeline triage,
         IBranchResolver resolver,
-        IDispatcher dispatcher)
+        IDispatcher dispatcher,
+        IGhClient gh)
     {
         _logger = logger;
         _options = options;
@@ -46,6 +48,7 @@ public class Worker : BackgroundService
         _triage = triage;
         _resolver = resolver;
         _dispatcher = dispatcher;
+        _gh = gh;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -76,6 +79,34 @@ public class Worker : BackgroundService
         }
 
         await _stateStore.InitializeAsync(cancellationToken);
+
+        // gh-auth probe. We don't want every poll's "no notifications" log entry to be the
+        // first hint that gh isn't logged in — surface the configuration mistake at startup
+        // with a single explicit message. We intentionally don't fail-fast: the operator
+        // might `gh auth login` while we're running, and the actual poll path has its own
+        // GhAuthException handling that emits warnings on every tick until it recovers.
+        try
+        {
+            var login = await _gh.WhoAmIAsync(cancellationToken);
+            _logger.LogInformation("gh authenticated as {Login}", string.IsNullOrEmpty(login) ? "(no login field returned)" : login);
+
+            if (!string.IsNullOrEmpty(_options.Value.AiUserLogin)
+                && !string.Equals(login, _options.Value.AiUserLogin, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "gh login {Actual} does not match configured AiUserLogin {Configured} — self-authored notifications will not be filtered",
+                    login, _options.Value.AiUserLogin);
+            }
+        }
+        catch (GhAuthException ex)
+        {
+            _logger.LogCritical(ex,
+                "gh is not authenticated at startup. The daemon will tick but every poll will fail until `gh auth login` is run.");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "gh /user probe failed at startup — continuing degraded");
+        }
 
         try
         {
