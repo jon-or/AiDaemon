@@ -167,6 +167,19 @@ public class RcLauncher : IRcLauncher
         if (!_fs.FileExists(path))
             return false;
 
+        // claude.exe rewrites the registry file in place when bridge state changes. A read
+        // landing mid-write produces an IOException or JsonException — without a retry, the
+        // dispatcher would reap a healthy RC because we caught the file in flux. One retry
+        // after 100ms is enough to clear that window in practice.
+        if (TryReadBridgeId(path, claudePid))
+            return true;
+
+        Thread.Sleep(100);
+        return TryReadBridgeId(path, claudePid);
+    }
+
+    bool TryReadBridgeId(string path, int claudePid)
+    {
         try
         {
             var json = _fs.ReadAllText(path);
@@ -177,7 +190,7 @@ public class RcLauncher : IRcLauncher
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            _logger.LogDebug(ex, "IsAlive: registry read transient failure for PID {Pid} — treating as dead", claudePid);
+            _logger.LogDebug(ex, "IsAlive: registry read transient failure for PID {Pid}", claudePid);
             return false;
         }
     }
