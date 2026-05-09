@@ -89,6 +89,10 @@ public class DispatcherTests : IDisposable
             .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
             .ReturnsAsync(true);
 
+        // The dispatcher checks for the post-pre-run JSONL to decide whether to resume or
+        // fresh-spawn. Pre-run succeeded → JSONL exists.
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
+
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
             .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
@@ -217,6 +221,64 @@ public class DispatcherTests : IDisposable
     }
 
     [Fact]
+    public async Task FirstEvent_PreRunWroteNoJsonl_FallsBackToFreshSpawn()
+    {
+        // Pre-run completes (no exception) but the JSONL is missing — e.g. the agent
+        // crashed before writing its first turn, or hit a network blip on the very first
+        // response. claude --resume <seedSid> would print "No conversation found"; the
+        // dispatcher must instead pass null so the launcher fresh-spawns and we capture
+        // whatever sid the new claude assigns.
+        var branch = Branch();
+        string? capturedSpawnSid = "(unset)";
+
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false); // is_error=true equivalent — no JSONL produced
+
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(false);
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
+            .ReturnsAsync(Att(sessionId: "fresh-launcher-assigned-sid"));
+
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        Assert.Equal(DispatchOutcome.Spawned, outcome);
+        Assert.Null(capturedSpawnSid); // fresh spawn, no resume
+
+        // The launcher-assigned sid is what ends up persisted.
+        var rec = await _store.GetBranchStateAsync(branch.Key, default);
+        Assert.Equal("fresh-launcher-assigned-sid", rec!.SessionId);
+    }
+
+    [Fact]
+    public async Task FirstEvent_PreRunWroteJsonl_PassesSeedSidToSpawn()
+    {
+        // Counterpart to the fallback test: pre-run wrote a JSONL → resume the seedSid.
+        var branch = Branch();
+        string? capturedPreRunSid = null;
+        string? capturedSpawnSid = null;
+
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
+            .ReturnsAsync(true);
+
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
+
+        await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        Assert.NotNull(capturedSpawnSid);
+        Assert.Equal(capturedPreRunSid, capturedSpawnSid);
+    }
+
+    [Fact]
     public async Task CrossTickResume_ExistingSessionId_SkipsPreRunAndRespawns()
     {
         var branch = Branch();
@@ -289,7 +351,8 @@ public class DispatcherTests : IDisposable
     public async Task SpawnFailure_ReturnsFailed_NoPush_PreservesPreRunSessionId()
     {
         var branch = Branch();
-        // Spawn fails for any sid the dispatcher generates.
+        // Pre-run succeeded → JSONL exists; the spawn itself is what fails.
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new TimeoutException("PowerShell never spawned claude.exe"));
 

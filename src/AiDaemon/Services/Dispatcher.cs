@@ -129,6 +129,23 @@ public class Dispatcher : IDispatcher
                     "pre-run threw — proceeding to RC anyway sid={Sid} branch={Branch}",
                     seedSid, key);
             }
+
+            // If the pre-run died before the agent wrote any turn (network blip on the very
+            // first response, hard timeout, or process crash) the JSONL file claude expects
+            // for `--resume <sid>` doesn't exist, and the RC window opens to a "No
+            // conversation found." message. Detect that and downgrade to a fresh spawn —
+            // the launcher will assign a new sid and we overwrite rec.SessionId after.
+            if (TryGetJsonlPath(rec, out var jsonlPath) && !_fs.FileExists(jsonlPath))
+            {
+                _logger.LogWarning(
+                    "pre-run wrote no JSONL for sid={Sid} branch={Branch} — falling back to fresh RC spawn",
+                    seedSid, key);
+                seedSid = null;
+                rec.SessionId = "";
+                // Don't persist here: SpawnRcAsync's success path overwrites rec.SessionId
+                // with the launcher-assigned value; if spawn itself fails, the catch below
+                // re-persists whatever sid we still have.
+            }
         }
         else
         {
@@ -146,9 +163,10 @@ public class Dispatcher : IDispatcher
         {
             _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid);
             // seedSid is already persisted on rec.SessionId (cross-tick reuse path: it was
-            // there when we entered; first-spawn path: we wrote it before pre-run). Just
-            // upsert to capture any field refresh and return.
-            rec.SessionId = seedSid;
+            // there when we entered; first-spawn path: we wrote it before pre-run). The
+            // empty-JSONL fallback above intentionally clears it so the next dispatch
+            // generates a brand-new sid and re-runs pre-run.
+            rec.SessionId = seedSid ?? "";
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
             return DispatchOutcome.Failed;
         }
