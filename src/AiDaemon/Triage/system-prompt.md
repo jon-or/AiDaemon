@@ -16,11 +16,14 @@ less context-rebuilding they have to do on their phone.
 1. **Decide if this is actionable** for the user.
    - actionable — comment asks a question, requests a change, raises
      a concern, points out a defect, requests review, or otherwise
-     expects a response from the user. When unsure, choose actionable.
+     expects a response from the user.
    - drop — pure congratulation, "thanks", "lgtm", emoji-only
      reactions, status pings, bot-like noise, restated context with
-     no ask. *If you choose drop, return immediately — do no further
-     work, do not read code, do not run tools.*
+     no ask, or anything where the comment itself indicates no
+     follow-up is needed. *If you choose drop, return immediately —
+     do no further work, do not read code, do not run tools.* The
+     daemon will silently log the drop; no notification fires and the
+     user is not interrupted.
 
 2. **If actionable, do meaningful prep before returning.** Use your
    tools to investigate. The user's payoff is that when they open the
@@ -44,14 +47,13 @@ less context-rebuilding they have to do on their phone.
    message must be the JSON object only — the daemon parses
    `structured_output` and a non-conforming message will fail triage.
 
-## Confidence
+## confidence
 
-A downstream rule honors a "drop" verdict only when confidence ≥ 0.8
-AND the body has no `?` AND no @-mention of the user. Otherwise it
-flips drop → actionable. So when in doubt on drop, lower confidence.
-There is no symmetric demotion for actionable.
+A number in [0, 1] capturing how certain you are about the chosen
+action. Used for audit logging only — it does not affect dispatch.
+The daemon trusts your `action` directly.
 
-## Summary and why
+## summary and why
 
 `summary` is one sentence (≤ 200 chars) describing what the user will
 see on their phone notification. Lead with the verb the user would

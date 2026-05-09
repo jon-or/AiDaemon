@@ -113,7 +113,24 @@ public class TriagePipeline : ITriagePipeline
     public async Task<TriageVerdict> AgentTriageAsync(GhNotification n, BranchInfo branch, CancellationToken cancellationToken)
     {
         var sid = Guid.NewGuid().ToString();
-        var userInput = BuildAgentInput(n, branch);
+
+        // Fetch the comment body once: the agent gets it inline (saves a tool round-trip) and
+        // the asymmetric-bias check needs it after the agent returns.
+        CommentInfo? comment = null;
+        if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
+        {
+            try
+            {
+                comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "agent triage: failed to pre-fetch comment body — agent can fetch via tools");
+            }
+        }
+        var commentBody = comment?.Body ?? "";
+
+        var userInput = BuildAgentInput(n, branch, commentBody);
 
         ClaudeJsonResult result;
         try
@@ -177,56 +194,22 @@ public class TriagePipeline : ITriagePipeline
                 sessionId: sid);
         }
 
-        var verdict = ApplyAsymmetricBias(llm, BodyForBiasCheck(n));
+        // Trust the agent's verdict directly — no post-hoc bias rule.
+        var action = string.Equals(llm.Action, "drop", StringComparison.OrdinalIgnoreCase)
+            ? TriageAction.Drop
+            : TriageAction.Actionable;
 
-        // Log the verdict + agent's session info. The agent's actual research/fix work lives
-        // in the JSONL transcript inside ~/.claude/projects/<encoded-cwd>/<sid>.jsonl and is
-        // what the user sees when they take over via RC.
+        var verdict = new TriageVerdict(action, llm.Why, llm.Summary, llm.Confidence, SessionId: sid);
+
         _logger.LogInformation(
             "L3 verdict thread={ThreadId} branch={Branch} sid={Sid} action={Action} confidence={Confidence:F2} why={Why}",
             n.Id, branch.Key, sid, verdict.Action, verdict.Confidence, verdict.Why);
 
-        return verdict with { SessionId = sid };
+        return verdict;
     }
-
-    /// <summary>
-    /// Honor an L3 "drop" only when the model is confident AND the body has no <c>?</c> AND
-    /// no @-mention of the user. Otherwise upgrade to actionable. False-drop is strictly
-    /// worse than false-actionable for this user.
-    /// </summary>
-    public TriageVerdict ApplyAsymmetricBias(TriageStructuredOutput llm, string fullBody)
-    {
-        var requestedDrop = string.Equals(llm.Action, "drop", StringComparison.OrdinalIgnoreCase);
-        if (!requestedDrop)
-            return new TriageVerdict(TriageAction.Actionable, llm.Why, llm.Summary, llm.Confidence);
-
-        var hasQuestion = fullBody.Contains('?');
-        var atMention = !string.IsNullOrEmpty(_options.AiUserLogin) &&
-            Regex.IsMatch(fullBody, $@"@{Regex.Escape(_options.AiUserLogin)}\b", RegexOptions.IgnoreCase);
-
-        if (llm.Confidence >= 0.8 && !hasQuestion && !atMention)
-            return new TriageVerdict(TriageAction.Drop, llm.Why, llm.Summary, llm.Confidence);
-
-        var upgradeReason = (llm.Confidence < 0.8 ? "low-confidence" : "")
-            + (hasQuestion ? " has-question" : "")
-            + (atMention ? " at-mention" : "");
-        return new TriageVerdict(
-            TriageAction.Actionable,
-            $"upgraded from drop ({upgradeReason.Trim()}): {llm.Why}",
-            llm.Summary,
-            llm.Confidence);
-    }
-
-    /// <summary>
-    /// Bias check looks at the comment body for <c>?</c> and @-mentions. We re-fetch the body
-    /// at agent-triage time to keep this self-contained — the QuickTriage call doesn't return
-    /// the body, and the agent may already have the content from its own tool use anyway.
-    /// </summary>
-    static string BodyForBiasCheck(GhNotification n)
-        => n.Subject.Title ?? "";
 
     /// <summary>The user message the agent receives. Includes everything it needs to investigate.</summary>
-    static string BuildAgentInput(GhNotification n, BranchInfo branch)
+    static string BuildAgentInput(GhNotification n, BranchInfo branch, string commentBody)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# GitHub notification");
@@ -240,8 +223,17 @@ public class TriagePipeline : ITriagePipeline
         sb.AppendLine($"- Worktree (your cwd): {branch.Worktree}");
         if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
         {
-            sb.AppendLine($"- Latest comment URL (use `gh api` if you need the body): {n.Subject.LatestCommentUrl}");
+            sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
         }
+
+        if (!string.IsNullOrEmpty(commentBody))
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Comment body");
+            sb.AppendLine();
+            sb.AppendLine(commentBody);
+        }
+
         sb.AppendLine();
         sb.AppendLine("Triage this notification per your system prompt. If actionable, do meaningful prep using your tools, then return the JSON verdict.");
         return sb.ToString();

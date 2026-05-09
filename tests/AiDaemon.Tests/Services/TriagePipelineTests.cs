@@ -233,10 +233,21 @@ public class TriagePipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task Agent_HighConfidenceDrop_WithCleanSubject_HonoredAsDrop()
+    public async Task Agent_DropVerdict_HonoredDirectly()
     {
         StubAgent("drop", 0.95, why: "status update");
-        // n.Subject.Title is "Some thread" — no `?`, no @-mention.
+
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+
+        Assert.Equal(TriageAction.Drop, v.Action);
+        Assert.Equal("status update", v.Why);
+    }
+
+    [Fact]
+    public async Task Agent_LowConfidenceDrop_StillHonoredAsDrop()
+    {
+        // No bias rule — the LLM's verdict is taken directly.
+        StubAgent("drop", 0.6, why: "borderline");
 
         var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
@@ -244,25 +255,14 @@ public class TriagePipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task Agent_LowConfidenceDrop_UpgradedToActionable()
+    public async Task Agent_ActionableVerdict_HonoredDirectly()
     {
-        StubAgent("drop", 0.6, why: "borderline");
+        StubAgent("actionable", 0.4, why: "needs review");
 
         var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.Contains("low-confidence", v.Why);
-    }
-
-    [Fact]
-    public async Task Agent_ActionableNotDemoted_RegardlessOfConfidence()
-    {
-        StubAgent("actionable", 0.4, why: "low-conf actionable");
-
-        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
-
-        Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.DoesNotContain("upgraded", v.Why);
+        Assert.Equal("needs review", v.Why);
     }
 
     [Fact]
