@@ -159,6 +159,7 @@ public class Worker : BackgroundService
         var dropped = 0;
         var actionable = 0;
         var coalesced = 0;
+        var failed = 0;
 
         // ============================================================================
         // Pass 1: poll every notification, run cheap L1+L2 filters, resolve to a branch,
@@ -272,8 +273,9 @@ public class Worker : BackgroundService
                 continue;
             }
 
-            actionable++;                       // count once per branch — the unit of dispatch
-            coalesced += batch.Items.Count - 1; // any extras on the same branch were absorbed
+            // Any extras on the same branch were absorbed into this batch regardless of
+            // whether dispatch ultimately succeeds; the work of grouping them happened.
+            coalesced += batch.Items.Count - 1;
             _logger.LogInformation(
                 "verdict branch={Branch} count={Count} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
                 branchKey, batch.Items.Count, verdict.Summary, verdict.Why, verdict.Confidence);
@@ -289,6 +291,14 @@ public class Worker : BackgroundService
                 dispatchOutcome = DispatchOutcome.Failed;
             }
 
+            // 'actionable' is the headline figure for the human reading the tick log: the
+            // number of branches that produced a real spawn or heads-up. Failures get
+            // their own bucket so a flaky run doesn't masquerade as a productive one.
+            if (dispatchOutcome == DispatchOutcome.Failed)
+                failed++;
+            else
+                actionable++;
+
             var outcome = dispatchOutcome switch
             {
                 DispatchOutcome.Spawned => $"spawned:{branchKey}",
@@ -300,8 +310,8 @@ public class Worker : BackgroundService
 
         if (seen > 0)
             _logger.LogInformation(
-                "tick seen={Seen} dropped={Dropped} actionable={Actionable} coalesced={Coalesced} branches={Branches}",
-                seen, dropped, actionable, coalesced, byBranch.Count);
+                "tick seen={Seen} dropped={Dropped} actionable={Actionable} failed={Failed} coalesced={Coalesced} branches={Branches}",
+                seen, dropped, actionable, failed, coalesced, byBranch.Count);
         else
             _logger.LogDebug("tick (no new notifications)");
     }
