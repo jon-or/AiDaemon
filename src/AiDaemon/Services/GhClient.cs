@@ -1,0 +1,141 @@
+using System.Text.Json;
+using AiDaemon.Configuration;
+using AiDaemon.Models;
+using AiDaemon.Process;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+namespace AiDaemon.Services;
+
+public class GhClient : IGhClient
+{
+    static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    readonly IProcessRunner _runner;
+    readonly DaemonOptions _options;
+    readonly ILogger<GhClient> _logger;
+
+    public GhClient(IProcessRunner runner, IOptions<DaemonOptions> options, ILogger<GhClient> logger)
+    {
+        _runner = runner;
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    public async Task<T> ApiAsync<T>(string path, CancellationToken cancellationToken)
+    {
+        var result = await RunGhAsync(new[] { "api", path }, cancellationToken);
+        return Deserialize<T>(result.Stdout, path);
+    }
+
+    public Task ApiVoidAsync(string method, string path, CancellationToken cancellationToken)
+        => RunGhAsync(new[] { "api", "-X", method, path }, cancellationToken);
+
+    public async Task<IReadOnlyList<GhNotification>> ListNotificationsAsync(CancellationToken cancellationToken)
+    {
+        // --paginate would auto-walk Link headers, but at this user's scale page 1 is plenty.
+        var result = await RunGhAsync(
+            new[] { "api", "/notifications?participating=true&all=false&per_page=50" },
+            cancellationToken);
+
+        var list = Deserialize<List<GhNotification>>(result.Stdout, "/notifications");
+        return list;
+    }
+
+    public Task MarkThreadReadAsync(string threadId, CancellationToken cancellationToken)
+        => ApiVoidAsync("PATCH", $"/notifications/threads/{threadId}", cancellationToken);
+
+    public async Task<CommentInfo?> GetCommentAsync(string url, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return null;
+
+        var path = ToGhApiPath(url);
+        try
+        {
+            var result = await RunGhAsync(new[] { "api", path }, cancellationToken);
+            return Deserialize<CommentInfo>(result.Stdout, path);
+        }
+        catch (GhCliException ex) when (ex.Stderr.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+        {
+            // Comment was deleted between notification fetch and dereference.
+            _logger.LogDebug("Comment URL 404'd: {Url}", url);
+            return null;
+        }
+    }
+
+    public Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken)
+        => ApiAsync<PrInfo>($"/repos/{repoFullName}/pulls/{prNumber}", cancellationToken);
+
+    public async Task<string> WhoAmIAsync(CancellationToken cancellationToken)
+    {
+        var doc = await ApiAsync<JsonElement>("/user", cancellationToken);
+        return doc.TryGetProperty("login", out var login) ? login.GetString() ?? "" : "";
+    }
+
+    async Task<ProcessResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
+    {
+        var env = new Dictionary<string, string?>();
+        if (!string.IsNullOrWhiteSpace(_options.GhConfigDir))
+            env["GH_CONFIG_DIR"] = _options.GhConfigDir;
+
+        var result = await _runner.RunAsync(_options.GhPath, args, environment: env, cancellationToken: cancellationToken);
+
+        if (result.Succeeded)
+            return result;
+
+        if (LooksLikeAuthFailure(result.Stderr))
+        {
+            _logger.LogError(
+                "gh auth failure (exit {ExitCode}). Run `gh auth login` inside GH_CONFIG_DIR={GhConfigDir}. Stderr: {Stderr}",
+                result.ExitCode, _options.GhConfigDir, result.Stderr.Trim());
+            throw new GhAuthException(result.ExitCode, result.Stderr);
+        }
+
+        var msg = $"gh {string.Join(' ', args)} failed (exit {result.ExitCode}): {result.Stderr.Trim()}";
+        throw new GhCliException(result.ExitCode, result.Stderr, msg);
+    }
+
+    static bool LooksLikeAuthFailure(string stderr)
+        => stderr.Contains("HTTP 401", StringComparison.OrdinalIgnoreCase)
+        || stderr.Contains("HTTP 403", StringComparison.OrdinalIgnoreCase)
+        || stderr.Contains("Bad credentials", StringComparison.OrdinalIgnoreCase)
+        || stderr.Contains("gh auth login", StringComparison.OrdinalIgnoreCase)
+        || stderr.Contains("GH_TOKEN", StringComparison.Ordinal)
+        || (stderr.Contains("authentication", StringComparison.OrdinalIgnoreCase)
+            && stderr.Contains("required", StringComparison.OrdinalIgnoreCase));
+
+    static T Deserialize<T>(string stdout, string context)
+    {
+        try
+        {
+            var v = JsonSerializer.Deserialize<T>(stdout, JsonOpts)
+                ?? throw new InvalidOperationException($"gh returned null JSON for {context}");
+            return v;
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException(
+                $"Failed to parse gh stdout for {context}: {ex.Message}. First 200 chars: {Truncate(stdout, 200)}",
+                ex);
+        }
+    }
+
+    static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+    /// <summary>
+    /// `gh api` accepts either an absolute https://api.github.com URL or just the path part.
+    /// Notification subject URLs come back absolute; strip the host so the call matches the
+    /// notification helper's path-only style and works with hosts other than github.com.
+    /// </summary>
+    static string ToGhApiPath(string url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var u))
+            return u.PathAndQuery;
+
+        return url;
+    }
+}

@@ -28,4 +28,8 @@
     <None Update="appsettings.Local.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('appsettings.Local.json')" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Storage\Schema.sql" />
+  </ItemGroup>
+
 </Project>
