@@ -1,4 +1,5 @@
 using AiDaemon.Configuration;
+using AiDaemon.Models;
 using AiDaemon.Services;
 using AiDaemon.Storage;
 using Microsoft.Extensions.Options;
@@ -12,6 +13,7 @@ public class Worker : BackgroundService
     readonly IHostApplicationLifetime _lifetime;
     readonly IStateStore _stateStore;
     readonly INotificationPoller _poller;
+    readonly ITriagePipeline _triage;
 
     Mutex? _instanceMutex;
 
@@ -20,13 +22,15 @@ public class Worker : BackgroundService
         IOptions<DaemonOptions> options,
         IHostApplicationLifetime lifetime,
         IStateStore stateStore,
-        INotificationPoller poller)
+        INotificationPoller poller,
+        ITriagePipeline triage)
     {
         _logger = logger;
         _options = options;
         _lifetime = lifetime;
         _stateStore = stateStore;
         _poller = poller;
+        _triage = triage;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -108,7 +112,8 @@ public class Worker : BackgroundService
     async Task TickAsync(CancellationToken cancellationToken)
     {
         var seen = 0;
-        var fresh = 0;
+        var dropped = 0;
+        var actionable = 0;
 
         await foreach (var n in _poller.PollAsync(cancellationToken))
         {
@@ -119,14 +124,44 @@ public class Worker : BackgroundService
                 "notification thread={ThreadId} repo={Repo} type={Type} reason={Reason} title={Title}",
                 n.Id, n.Repository.FullName, n.Subject.Type, n.Reason, n.Subject.Title);
 
-            // Phase 1: just record we saw it. Triage + dispatch land in Phase 2/4.
-            await _stateStore.MarkProcessedAsync(n.Id, commentId, "seen", cancellationToken);
-            fresh++;
+            TriageVerdict verdict;
+            try
+            {
+                verdict = await _triage.TriageAsync(n, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "triage threw thread={ThreadId} — skipping", n.Id);
+                continue;
+            }
+
+            string outcome;
+            if (verdict.Action == TriageAction.Drop)
+            {
+                dropped++;
+                outcome = $"dropped:{verdict.Why}";
+                _logger.LogInformation(
+                    "verdict thread={ThreadId} action=Drop why={Why}",
+                    n.Id, verdict.Why);
+            }
+            else
+            {
+                actionable++;
+                outcome = "actionable";
+                // Phase 4 will spawn an RC session here. For now, just log.
+                _logger.LogInformation(
+                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
+                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence);
+            }
+
+            await _stateStore.MarkProcessedAsync(n.Id, commentId, outcome, cancellationToken);
         }
 
         if (seen > 0)
-            _logger.LogInformation("tick processed={Fresh} new of {Seen} unread", fresh, seen);
+            _logger.LogInformation(
+                "tick seen={Seen} dropped={Dropped} actionable={Actionable}",
+                seen, dropped, actionable);
         else
-            _logger.LogDebug("tick (no unread notifications)");
+            _logger.LogDebug("tick (no new notifications)");
     }
 }

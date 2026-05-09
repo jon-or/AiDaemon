@@ -58,6 +58,8 @@ builder.Services.AddSerilog((sp, lc) => lc
 builder.Services.AddSingleton<IProcessRunner, ProcessRunner>();
 builder.Services.AddSingleton<IStateStore, SqliteStateStore>();
 builder.Services.AddSingleton<IGhClient, GhClient>();
+builder.Services.AddSingleton<IClaudeRunner, ClaudeRunner>();
+builder.Services.AddSingleton<ITriagePipeline, TriagePipeline>();
 builder.Services.AddSingleton<INotificationPoller, NotificationPoller>();
 
 builder.Services.AddHostedService<Worker>();
