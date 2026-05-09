@@ -195,6 +195,97 @@ public class DispatcherTests : IDisposable
     }
 
     [Fact]
+    public async Task FirstEvent_PreRunThrows_StillProceedsToSpawn()
+    {
+        var branch = Branch();
+        _preRunner.Setup(p => p.RunAsync(
+                It.IsAny<string>(), It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("pre-run blew up"));
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
+
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        // Non-OCE pre-run failures are warnings, not aborts — RC still opens so the user
+        // can see the conversation lineage and pick up where pre-run left off (if it left
+        // anything behind at all).
+        Assert.Equal(DispatchOutcome.Spawned, outcome);
+        _launcher.Verify(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task CrossTickResume_ExistingSessionId_SkipsPreRunAndRespawns()
+    {
+        var branch = Branch();
+        var existingSid = "previously-persisted-sid";
+
+        // Pre-seed an Idle row carrying a sid from a prior failed spawn or reaped session.
+        await _store.UpsertBranchStateAsync(new BranchState
+        {
+            Branch = branch.Key,
+            SessionId = existingSid,
+            Worktree = branch.Worktree,
+            Mode = BranchMode.Idle,
+            LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 100,
+            IssueNumber = 16119,
+        }, default);
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, existingSid, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Att(sessionId: existingSid));
+
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        Assert.Equal(DispatchOutcome.Spawned, outcome);
+
+        // Cross-tick resume must NOT re-run the pre-run agent — that's the whole reason we
+        // persist the sid early. Re-running would produce duplicate edits in the worktree.
+        _preRunner.Verify(p => p.RunAsync(
+                It.IsAny<string>(), It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // Spawn was passed the existing sid, not a freshly generated one.
+        _launcher.Verify(l => l.SpawnRcAsync(branch, existingSid, It.IsAny<CancellationToken>()), Times.Once);
+
+        var rec = await _store.GetBranchStateAsync(branch.Key, default);
+        Assert.Equal(existingSid, rec!.SessionId);
+        Assert.Equal(BranchMode.RcActive, rec.Mode);
+    }
+
+    [Fact]
+    public async Task FirstEvent_PersistsSessionIdBeforePreRun()
+    {
+        // The whole point of writing rec.SessionId before pre-run is to survive a daemon
+        // crash mid-pre-run. Simulate that by having pre-run inspect the state store at
+        // the moment it runs and assert the sid is already persisted.
+        var branch = Branch();
+        string? sidVisibleToPreRun = null;
+
+        _preRunner.Setup(p => p.RunAsync(
+                It.IsAny<string>(), It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback(async (string sid, BranchInfo b, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) =>
+            {
+                var snapshot = await _store.GetBranchStateAsync(b.Key, default);
+                sidVisibleToPreRun = snapshot?.SessionId;
+            })
+            .ReturnsAsync(true);
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
+
+        await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        Assert.False(string.IsNullOrEmpty(sidVisibleToPreRun),
+            "rec.SessionId must be persisted before pre-run starts so a mid-pre-run crash leaves the sid recoverable");
+    }
+
+    [Fact]
     public async Task SpawnFailure_ReturnsFailed_NoPush_PreservesPreRunSessionId()
     {
         var branch = Branch();
@@ -271,13 +362,32 @@ public class DispatcherTests : IDisposable
         }, default);
 
         _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(true);
-        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
+
+        // Capture the path the dispatcher actually queries against — assert it equals the
+        // exact JSONL location claude writes (encoded worktree + sessionId.jsonl). A
+        // regression in TryGetJsonlPath wiring (e.g. forgotten ToLower flip, swapped sid
+        // and dir) would otherwise pass because both _fs.Setup calls match It.IsAny<string>().
+        var expectedJsonlPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".claude", "projects",
+            Dispatcher.EncodeWorktreeAsProjectDir(branch.Worktree),
+            $"{sid}.jsonl");
+
+        string? capturedFileExistsPath = null;
+        string? capturedMtimePath = null;
+        _fs.Setup(f => f.FileExists(It.IsAny<string>()))
+            .Callback((string p) => capturedFileExistsPath = p)
+            .Returns(true);
         _fs.Setup(f => f.GetLastWriteTimeUtc(It.IsAny<string>()))
+            .Callback((string p) => capturedMtimePath = p)
             .Returns(DateTime.UtcNow.AddHours(-3)); // older than 2h timeout
 
         _launcher.Setup(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
 
         await Build().SweepAsync(default);
+
+        Assert.Equal(expectedJsonlPath, capturedFileExistsPath);
+        Assert.Equal(expectedJsonlPath, capturedMtimePath);
 
         _launcher.Verify(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>()), Times.Once);
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
