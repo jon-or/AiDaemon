@@ -161,13 +161,21 @@ public class Dispatcher : IDispatcher
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid);
+            _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — RC unavailable", key, seedSid);
             // seedSid is already persisted on rec.SessionId (cross-tick reuse path: it was
             // there when we entered; first-spawn path: we wrote it before pre-run). The
             // empty-JSONL fallback above intentionally clears it so the next dispatch
             // generates a brand-new sid and re-runs pre-run.
             rec.SessionId = seedSid ?? "";
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
+
+            // Push anyway — the user still needs to know an actionable thing arrived even if
+            // the RC relay is down. Same shape as a normal session-link push, but with
+            // "Not Available" in the URL slot — NtfyPusher recognizes that as a non-real URL
+            // and suppresses the click/action button while still surfacing the status in the
+            // push body.
+            await _pusher.PushSessionLinkAsync("Not Available", branch, primary, verdict, cancellationToken);
+
             return DispatchOutcome.Failed;
         }
 

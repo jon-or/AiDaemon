@@ -348,23 +348,34 @@ public class DispatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task SpawnFailure_ReturnsFailed_NoPush_PreservesPreRunSessionId()
+    public async Task SpawnFailure_ReturnsFailed_FiresPushWithNotAvailableUrl_PreservesPreRunSessionId()
     {
         var branch = Branch();
         // Pre-run succeeded → JSONL exists; the spawn itself is what fails.
         _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new TimeoutException("PowerShell never spawned claude.exe"));
+            .ThrowsAsync(new TimeoutException("bridgeSessionId not populated within 5s for claude PID 13796"));
+
+        string? capturedUrl = null;
+        _pusher.Setup(p => p.PushSessionLinkAsync(
+                It.IsAny<string>(), branch, It.IsAny<GhNotification>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string url, BranchInfo _, GhNotification _, TriageVerdict _, CancellationToken _) => capturedUrl = url)
+            .Returns(Task.CompletedTask);
 
         var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
         Assert.Equal(DispatchOutcome.Failed, outcome);
-        _pusher.Verify(p => p.PushSessionLinkAsync(
-            It.IsAny<string>(), It.IsAny<BranchInfo>(), It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
-            Times.Never);
 
-        // The branch row exists in Idle and persists the sid we ran pre-run against, so the
-        // next dispatch can reuse it without re-running pre-run.
+        // The same PushSessionLinkAsync method fires, but with "Not Available" in the URL
+        // slot — NtfyPusher uses that as the cue to suppress the click/action button.
+        _pusher.Verify(p => p.PushSessionLinkAsync(
+            It.IsAny<string>(), branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+        Assert.Equal("Not Available", capturedUrl);
+
+        // The branch row persists the sid we ran pre-run against, so the next dispatch can
+        // reuse it without re-running pre-run.
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
         Assert.NotNull(rec);
         Assert.Equal(BranchMode.Idle, rec!.Mode);

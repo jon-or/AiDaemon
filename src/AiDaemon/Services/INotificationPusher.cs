@@ -5,8 +5,10 @@ namespace AiDaemon.Services;
 public interface INotificationPusher
 {
     /// <summary>
-    /// First push for a freshly-spawned RC session. The user taps it on their phone to open
-    /// the live session.
+    /// First push for a freshly-spawned RC session. Pass the bridge URL for a normal spawn,
+    /// or the literal string <c>"Not Available"</c> when the RC relay is down — the push
+    /// still goes out so the user sees the actionable event, and the pusher omits the click
+    /// target instead of producing an untappable button.
     /// </summary>
     Task PushSessionLinkAsync(
         string url,
@@ -27,8 +29,9 @@ public interface INotificationPusher
 }
 
 /// <summary>
-/// Phase 4 placeholder. Logs what it would push at <c>Information</c> level. Phase 5 replaces
-/// this with <c>NtfyPusher</c>.
+/// Test / debug pusher that logs every call at <c>Information</c> instead of going to the
+/// network. Useful when iterating on the pipeline without buzzing the phone, and as the
+/// drop-in for unit tests that want a non-Mock fake.
 /// </summary>
 public class NoopNotificationPusher : INotificationPusher
 {
