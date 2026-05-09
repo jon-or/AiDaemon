@@ -1,3 +1,4 @@
+using System.Text;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using AiDaemon.Services;
@@ -17,7 +18,15 @@ public class Worker : BackgroundService
     readonly IBranchResolver _resolver;
     readonly IDispatcher _dispatcher;
 
-    Mutex? _instanceMutex;
+    /// <summary>
+    /// Single-instance lock. We use an exclusive file handle (FileShare.None) instead of a
+    /// named Mutex because Mutex is thread-affine: only the thread that called WaitOne can
+    /// call ReleaseMutex, and StartAsync / StopAsync may run on different pool threads — the
+    /// resulting ApplicationException leaves the mutex abandoned, generating a noisy warning
+    /// on every restart. A file handle has no thread affinity, the OS releases it on either
+    /// clean exit or crash, and the file doubles as a PID dropbox for diagnostics.
+    /// </summary>
+    FileStream? _instanceLock;
 
     public Worker(
         ILogger<Worker> logger,
@@ -41,26 +50,27 @@ public class Worker : BackgroundService
 
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        bool owned;
+        var dataDir = _options.Value.DataDir;
+        Directory.CreateDirectory(dataDir);
+        var lockPath = Path.Combine(dataDir, "aidaemon.lock");
+
         try
         {
-            _instanceMutex = new Mutex(true, @"Global\AiDaemon", out owned);
+            // FileShare.Read so an operator can `Get-Content aidaemon.lock` to see the PID
+            // without breaking the exclusion. FileShare.None for write keeps a second daemon out.
+            _instanceLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+            _instanceLock.SetLength(0);
+            var pid = Encoding.UTF8.GetBytes($"{Environment.ProcessId}{Environment.NewLine}");
+            await _instanceLock.WriteAsync(pid, cancellationToken);
+            await _instanceLock.FlushAsync(cancellationToken);
         }
-        catch (AbandonedMutexException)
+        catch (IOException ex)
         {
-            // A prior instance died without releasing. .NET marks the mutex acquired by us;
-            // proceed as if we got it cleanly.
-            _logger.LogWarning("recovered abandoned Global\\AiDaemon mutex from a prior crashed instance");
-            _instanceMutex = new Mutex(true, @"Global\AiDaemon", out owned);
-        }
-
-        if (!owned)
-        {
-            // We don't own the handle, so we must not retain it — StopAsync would call
-            // ReleaseMutex and throw ApplicationException.
-            _instanceMutex.Dispose();
-            _instanceMutex = null;
-            _logger.LogCritical("Another instance of AiDaemon is already running. Exiting.");
+            _instanceLock?.Dispose();
+            _instanceLock = null;
+            _logger.LogCritical(ex,
+                "Another instance of AiDaemon is already running (lock file '{Path}' is held). Exiting.",
+                lockPath);
             _lifetime.StopApplication();
             return;
         }
@@ -81,22 +91,14 @@ public class Worker : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        // Release the mutex AFTER the host has signalled stoppingToken and waited for
+        // Release the lock AFTER the host has signalled stoppingToken and waited for
         // ExecuteAsync to unwind. Releasing earlier would let a fast-restarting second
-        // instance acquire the mutex during our shutdown grace period — two daemons
-        // running concurrently against the same state store and worktrees.
+        // instance acquire the lock during our shutdown grace period — two daemons running
+        // concurrently against the same state store and worktrees.
         await base.StopAsync(cancellationToken);
 
-        try
-        {
-            _instanceMutex?.ReleaseMutex();
-        }
-        catch (ApplicationException)
-        {
-        }
-
-        _instanceMutex?.Dispose();
-        _instanceMutex = null;
+        _instanceLock?.Dispose();
+        _instanceLock = null;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
