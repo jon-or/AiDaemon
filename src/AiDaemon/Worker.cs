@@ -155,8 +155,17 @@ public class Worker : BackgroundService
         _logger.LogInformation("AiDaemon worker stopping");
     }
 
+    /// <summary>Retention horizon for the dedup table. Anything older than this is safe to drop:
+    /// the cursor has long since advanced past it and no notification re-fires from history.</summary>
+    static readonly TimeSpan ProcessedRetention = TimeSpan.FromDays(30);
+
+    /// <summary>Cadence for the daily-style prune call. Runs at most once per period regardless of tick frequency.</summary>
+    static readonly TimeSpan ProcessedPruneInterval = TimeSpan.FromHours(24);
+
     internal async Task TickAsync(CancellationToken cancellationToken)
     {
+        await TryPruneProcessedAsync(cancellationToken);
+
         var seen = 0;
         var dropped = 0;
         var actionable = 0;
@@ -340,6 +349,43 @@ public class Worker : BackgroundService
                 seen, dropped, actionable, failed, coalesced, byBranch.Count);
         else
             _logger.LogDebug("tick (no new notifications)");
+    }
+
+    /// <summary>
+    /// Gated daily prune. The processed table accumulates one row per (thread_id, comment_id)
+    /// dedup pair; over months that's a few thousand rows on a busy account. The kv key
+    /// holds the last successful prune's UTC time, so this is O(kv-read) on every tick that
+    /// doesn't fire.
+    /// </summary>
+    async Task TryPruneProcessedAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var raw = await _stateStore.GetKvAsync(StateStoreKeys.ProcessedLastPruned, cancellationToken);
+            if (DateTimeOffset.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                    out var lastPruned)
+                && DateTimeOffset.UtcNow - lastPruned < ProcessedPruneInterval)
+            {
+                return;
+            }
+
+            var cutoff = DateTimeOffset.UtcNow - ProcessedRetention;
+            var deleted = await _stateStore.PruneProcessedAsync(cutoff, cancellationToken);
+            await _stateStore.SetKvAsync(
+                StateStoreKeys.ProcessedLastPruned,
+                DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                cancellationToken);
+
+            if (deleted > 0)
+                _logger.LogInformation(
+                    "pruned {Deleted} processed rows older than {Cutoff:O}", deleted, cutoff);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Prune failures must never block the actual tick work.
+            _logger.LogWarning(ex, "processed-table prune failed (will retry on the next tick after the gate clears)");
+        }
     }
 
     async Task MarkAllAsync(BranchBatch batch, string outcome, CancellationToken cancellationToken)

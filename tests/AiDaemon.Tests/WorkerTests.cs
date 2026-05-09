@@ -31,15 +31,24 @@ public class WorkerTests
         RepoAllowlist = new() { "ownerrez/orez" },
     };
 
-    Worker Build() => new(
-        NullLogger<Worker>.Instance,
-        Options.Create(_options),
-        _lifetime.Object,
-        _store.Object,
-        _poller.Object,
-        _triage.Object,
-        _resolver.Object,
-        _dispatcher.Object);
+    Worker Build()
+    {
+        // Daily processed-prune gate: every TickAsync call reads the last-pruned kv and either
+        // skips or runs PruneProcessedAsync. Default to "already pruned recently" so individual
+        // tests don't have to wire it; the prune behavior itself has its own focused tests.
+        _store.Setup(s => s.GetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+
+        return new Worker(
+            NullLogger<Worker>.Instance,
+            Options.Create(_options),
+            _lifetime.Object,
+            _store.Object,
+            _poller.Object,
+            _triage.Object,
+            _resolver.Object,
+            _dispatcher.Object);
+    }
 
     static GhNotification N(string id, string commentUrl, DateTimeOffset? updated = null) => new()
     {
@@ -312,6 +321,78 @@ public class WorkerTests
             It.IsAny<GhNotification>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_PruneGate_SkipsWhenLastPrunedIsRecent()
+    {
+        // Override the default "now" stub to a recent one and verify Prune isn't called.
+        _store.Setup(s => s.GetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DateTimeOffset.UtcNow.AddHours(-1).ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        _poller.Setup(p => p.PollAsync(It.IsAny<CancellationToken>()))
+            .Returns(ToAsync(Array.Empty<GhNotification>()));
+
+        // Build manually so the default GetKv setup in Build() doesn't override ours.
+        var w = new Worker(
+            NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+
+        await w.TickAsync(default);
+
+        _store.Verify(s => s.PruneProcessedAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Tick_PruneGate_RunsWhenLastPrunedIsStale()
+    {
+        // Last pruned > 24h ago → prune fires and the kv timestamp is updated.
+        _store.Setup(s => s.GetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DateTimeOffset.UtcNow.AddDays(-2).ToString("O", System.Globalization.CultureInfo.InvariantCulture));
+        _store.Setup(s => s.PruneProcessedAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(7);
+        _store.Setup(s => s.SetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _poller.Setup(p => p.PollAsync(It.IsAny<CancellationToken>()))
+            .Returns(ToAsync(Array.Empty<GhNotification>()));
+
+        var w = new Worker(
+            NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+
+        await w.TickAsync(default);
+
+        // Cutoff should be ~30 days ago; assert it's well in the past, not "now".
+        _store.Verify(s => s.PruneProcessedAsync(
+            It.Is<DateTimeOffset>(c => c < DateTimeOffset.UtcNow.AddDays(-29) && c > DateTimeOffset.UtcNow.AddDays(-31)),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+        _store.Verify(s => s.SetKvAsync(
+            StateStoreKeys.ProcessedLastPruned, It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_PruneFails_DoesNotAbortTick()
+    {
+        // A SQLite hiccup during prune must never block the actual tick work.
+        _store.Setup(s => s.GetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string?)null); // never pruned
+        _store.Setup(s => s.PruneProcessedAsync(It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("disk full"));
+        _poller.Setup(p => p.PollAsync(It.IsAny<CancellationToken>()))
+            .Returns(ToAsync(Array.Empty<GhNotification>()));
+
+        var w = new Worker(
+            NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object);
+
+        // Should not throw — the catch in TryPruneProcessedAsync swallows non-OCE.
+        await w.TickAsync(default);
+
+        // The kv should NOT have been updated (the prune failed, so don't suppress next attempt).
+        _store.Verify(s => s.SetKvAsync(
+            StateStoreKeys.ProcessedLastPruned, It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     [Fact]

@@ -36,4 +36,7 @@ public static class StateStoreKeys
 {
     /// <summary>ISO 8601 timestamp of the most recent notification updated_at we've polled past.</summary>
     public const string NotificationCursor = "notifications.cursor";
+
+    /// <summary>ISO 8601 timestamp of the last successful PruneProcessedAsync. Gates the daily run.</summary>
+    public const string ProcessedLastPruned = "processed.last_pruned_utc";
 }
