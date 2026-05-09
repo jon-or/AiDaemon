@@ -170,6 +170,11 @@ public class Worker : BackgroundService
         // ============================================================================
         var byBranch = new Dictionary<string, BranchBatch>(StringComparer.Ordinal);
 
+        // Per-tick resolve cache. Multiple notifications on the same PR / issue would
+        // otherwise each fire a `gh api /pulls/N` and a `git rev-parse`; keying on
+        // (repo|subject.url) lets us pay that cost once per tick. Lifetime is the tick.
+        var resolveCache = new Dictionary<string, BranchInfo?>(StringComparer.Ordinal);
+
         await foreach (var n in _poller.PollAsync(cancellationToken))
         {
             seen++;
@@ -211,15 +216,26 @@ public class Worker : BackgroundService
 
             BranchInfo? branch = null;
             string? resolveOutcome = null;
-            try
+            var cacheKey = $"{n.Repository.FullName}|{n.Subject.Url}";
+            if (resolveCache.TryGetValue(cacheKey, out var cached))
             {
-                branch = await _resolver.ResolveAsync(n, cancellationToken);
+                branch = cached;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            else
             {
-                _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
-                failed++;
-                resolveOutcome = $"failed:resolve:{ex.GetType().Name}";
+                try
+                {
+                    branch = await _resolver.ResolveAsync(n, cancellationToken);
+                    resolveCache[cacheKey] = branch;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
+                    failed++;
+                    resolveOutcome = $"failed:resolve:{ex.GetType().Name}";
+                    // Don't cache exception results — a transient failure shouldn't poison
+                    // the rest of the tick for sibling notifications on the same subject.
+                }
             }
 
             if (branch == null)

@@ -272,6 +272,49 @@ public class WorkerTests
     }
 
     [Fact]
+    public async Task Tick_ResolveCachedPerTick_AvoidsDuplicateNetworkAndGitWork()
+    {
+        // Two notifications, same subject URL → resolver should be called once per tick.
+        // Real-world: a PR with five comments fires five notifications; each used to
+        // trigger gh+git for the same PR. The per-tick cache avoids that.
+        var n1 = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-B", "https://api.github.com/repos/o/r/issues/comments/2");
+        // Both notifications point at the same subject URL.
+        n1.Subject.Url = "https://api.github.com/repos/o/r/pulls/42";
+        n2.Subject.Url = "https://api.github.com/repos/o/r/pulls/42";
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TriageVerdict.Actionable("go", "x", 0.9));
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DispatchOutcome.Spawned);
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(s => s.IncrementRateLimitAsync(
+                It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        await Build().TickAsync(default);
+
+        _resolver.Verify(r => r.ResolveAsync(
+            It.IsAny<GhNotification>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task Tick_ResolverThrows_MarksFailedResolveAndSkips()
     {
         var n = N("thread-X", "https://api.github.com/repos/o/r/issues/comments/9");
