@@ -28,7 +28,6 @@ public class TriageOptions
     /// <summary>Model used by the headless pre-run agent in the worktree (does the actual research/fix).</summary>
     public string PreRunModel { get; set; } = "opus";
 
-    public bool BareMode { get; set; } = true;
     public int MaxActionsPerThreadPerDay { get; set; } = 5;
     public List<string> L2DropPatterns { get; set; } = new();
 }

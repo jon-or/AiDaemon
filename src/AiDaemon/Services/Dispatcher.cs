@@ -144,9 +144,11 @@ public class Dispatcher : IDispatcher
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid ?? "(fresh)");
-            // Persist whatever state we have so the next attempt resumes correctly.
-            rec.SessionId = seedSid ?? rec.SessionId;
+            _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid);
+            // seedSid is already persisted on rec.SessionId (cross-tick reuse path: it was
+            // there when we entered; first-spawn path: we wrote it before pre-run). Just
+            // upsert to capture any field refresh and return.
+            rec.SessionId = seedSid;
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
             return DispatchOutcome.Failed;
         }

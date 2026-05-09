@@ -228,7 +228,6 @@ public class Worker : BackgroundService
             }
 
             batch.Items.Add(new NotificationWithBody(n, commentBody));
-            batch.QuickShortcut ??= quick;  // remember any L1 shortcut-actionable for pass 2
         }
 
         // ============================================================================
@@ -238,29 +237,19 @@ public class Worker : BackgroundService
         // ============================================================================
         foreach (var (branchKey, batch) in byBranch)
         {
-            var primaryNotificationId = batch.PrimaryNotificationId;
-            var commentIds = batch.Items.Select(i => NotificationPoller.DeriveCommentId(i.Notification)).ToList();
-
             // ---------- L3 agent triage in scratch ----------
             TriageVerdict verdict;
-            if (batch.QuickShortcut is { Action: TriageAction.Actionable } shortcut)
+            try
             {
-                verdict = shortcut;
+                verdict = await _triage.AgentTriageAsync(batch.Items, batch.Branch, cancellationToken);
             }
-            else
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                try
-                {
-                    verdict = await _triage.AgentTriageAsync(batch.Items, batch.Branch, cancellationToken);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogError(ex,
-                        "agent triage threw branch={Branch} count={Count}",
-                        branchKey, batch.Items.Count);
-                    await MarkAllAsync(batch, $"failed:agent-triage:{branchKey}", cancellationToken);
-                    continue;
-                }
+                _logger.LogError(ex,
+                    "agent triage threw branch={Branch} count={Count}",
+                    branchKey, batch.Items.Count);
+                await MarkAllAsync(batch, $"failed:agent-triage:{branchKey}", cancellationToken);
+                continue;
             }
 
             if (verdict.Action == TriageAction.Drop)
@@ -334,17 +323,6 @@ public class Worker : BackgroundService
         public BranchInfo Branch { get; }
         public List<NotificationWithBody> Items { get; } = new();
 
-        /// <summary>
-        /// First non-null actionable verdict produced by L1 (e.g. a future short-circuit).
-        /// Pass 2 prefers this over running L3 when present.
-        /// </summary>
-        public TriageVerdict? QuickShortcut { get; set; }
-
         public BranchBatch(BranchInfo branch) { Branch = branch; }
-
-        /// <summary>The id of the most recent notification in the batch (by updated_at).</summary>
-        public string PrimaryNotificationId => Items
-            .OrderByDescending(i => i.Notification.UpdatedAt)
-            .First().Notification.Id;
     }
 }
