@@ -21,8 +21,11 @@ public class TriagePipeline : ITriagePipeline
         "PullRequest",
     };
 
-    /// <summary>Per-call timeout for the L3 claude invocation.</summary>
-    static readonly TimeSpan L3Timeout = TimeSpan.FromSeconds(30);
+    /// <summary>
+    /// Per-call timeout for the L3 agent run. Bigger than Phase 2's classifier window — the
+    /// agent now reads files, runs git, edits code; multi-turn tool use takes time.
+    /// </summary>
+    static readonly TimeSpan L3Timeout = TimeSpan.FromMinutes(5);
 
     readonly IGhClient _gh;
     readonly IClaudeRunner _claude;
@@ -58,7 +61,7 @@ public class TriagePipeline : ITriagePipeline
         _botBlocklist = new HashSet<string>(_options.BotAuthorBlocklist, StringComparer.OrdinalIgnoreCase);
     }
 
-    public async Task<TriageVerdict> TriageAsync(GhNotification n, CancellationToken cancellationToken)
+    public async Task<TriageVerdict?> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
     {
         // ---------- L1: author / type / reason / rate ----------
         if (!SupportedSubjectTypes.Contains(n.Subject.Type))
@@ -67,11 +70,7 @@ public class TriagePipeline : ITriagePipeline
         if (!_actionableReasons.Contains(n.Reason))
             return TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons");
 
-        // review_requested has no comment body to evaluate. Skip L2/L3.
-        if (string.Equals(n.Reason, "review_requested", StringComparison.OrdinalIgnoreCase))
-            return TriageVerdict.Actionable("review_requested", $"Review requested: {n.Subject.Title}");
-
-        // L1 author check requires the comment body. Fetch it once and reuse.
+        // L1 author check requires the comment body. Fetch once and reuse for L2 below.
         CommentInfo? comment = null;
         if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
             comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
@@ -107,48 +106,93 @@ public class TriagePipeline : ITriagePipeline
                 return TriageVerdict.Drop($"L2 regex match: /{pat}/");
         }
 
-        // ---------- L3: LLM ----------
-        if (string.IsNullOrWhiteSpace(stripped))
-        {
-            // No body to feed L3. Default to actionable per asymmetric bias.
-            _logger.LogInformation(
-                "L3 skipped (empty body) thread={ThreadId} reason={Reason}", n.Id, n.Reason);
-            return TriageVerdict.Actionable("empty body — defaulted to actionable");
-        }
+        // Defer to agent triage.
+        return null;
+    }
 
-        TriageStructuredOutput? llm;
+    public async Task<TriageVerdict> AgentTriageAsync(GhNotification n, BranchInfo branch, CancellationToken cancellationToken)
+    {
+        var sid = Guid.NewGuid().ToString();
+        var userInput = BuildAgentInput(n, branch);
+
+        ClaudeJsonResult result;
         try
         {
-            llm = await CallL3Async(stripped, cancellationToken);
+            result = await _claude.RunHeadlessJsonAsync(
+                systemPrompt: _systemPrompt.Value,
+                userInput: userInput,
+                schemaJson: _schema.Value,
+                model: _options.Triage.Model,
+                workingDirectory: branch.Worktree,
+                timeout: L3Timeout,
+                cancellationToken: cancellationToken,
+                sessionId: sid,
+                permissionMode: "bypassPermissions");
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
-                "L3 call failed thread={ThreadId} — defaulting to actionable", n.Id);
-            return TriageVerdict.Actionable($"L3 error ({ex.GetType().Name}) — actionable by default");
+                "agent triage failed thread={ThreadId} branch={Branch} — defaulting to actionable",
+                n.Id, branch.Key);
+            return TriageVerdict.Actionable(
+                $"agent error ({ex.GetType().Name}) — actionable by default",
+                summary: TruncateSummary(n.Subject.Title),
+                confidence: 0.5,
+                sessionId: sid);
+        }
+
+        if (result.IsError)
+        {
+            _logger.LogWarning(
+                "agent triage is_error=true thread={ThreadId} branch={Branch} result={Result} — defaulting to actionable",
+                n.Id, branch.Key, result.Result);
+            return TriageVerdict.Actionable(
+                "agent reported is_error=true — actionable by default",
+                summary: TruncateSummary(n.Subject.Title),
+                confidence: 0.5,
+                sessionId: sid);
+        }
+
+        TriageStructuredOutput? llm = null;
+        if (result.StructuredOutput is JsonElement so)
+        {
+            try
+            {
+                llm = JsonSerializer.Deserialize<TriageStructuredOutput>(so.GetRawText(), JsonOpts);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "agent triage produced unparseable structured_output thread={ThreadId}", n.Id);
+            }
         }
 
         if (llm == null)
         {
             _logger.LogWarning(
-                "L3 returned no structured output thread={ThreadId} — defaulting to actionable", n.Id);
-            return TriageVerdict.Actionable("L3 returned no structured output — actionable by default");
+                "agent triage returned no structured output thread={ThreadId} — defaulting to actionable", n.Id);
+            return TriageVerdict.Actionable(
+                "agent returned no structured output — actionable by default",
+                summary: TruncateSummary(n.Subject.Title),
+                confidence: 0.5,
+                sessionId: sid);
         }
 
-        var verdict = ApplyAsymmetricBias(llm, body);
+        var verdict = ApplyAsymmetricBias(llm, BodyForBiasCheck(n));
 
-        // Audit trail: log the full body on every verdict so we can spot-check L3 drops later.
+        // Log the verdict + agent's session info. The agent's actual research/fix work lives
+        // in the JSONL transcript inside ~/.claude/projects/<encoded-cwd>/<sid>.jsonl and is
+        // what the user sees when they take over via RC.
         _logger.LogInformation(
-            "L3 verdict thread={ThreadId} action={Action} confidence={Confidence:F2} why={Why} body={Body}",
-            n.Id, verdict.Action, verdict.Confidence, verdict.Why, body);
+            "L3 verdict thread={ThreadId} branch={Branch} sid={Sid} action={Action} confidence={Confidence:F2} why={Why}",
+            n.Id, branch.Key, sid, verdict.Action, verdict.Confidence, verdict.Why);
 
-        return verdict;
+        return verdict with { SessionId = sid };
     }
 
     /// <summary>
-    /// Honor an L3 "drop" only when the model is confident AND the body has no `?` AND no
-    /// @-mention of the user. Otherwise upgrade to actionable. False-drop is strictly worse
-    /// than false-actionable for this user.
+    /// Honor an L3 "drop" only when the model is confident AND the body has no <c>?</c> AND
+    /// no @-mention of the user. Otherwise upgrade to actionable. False-drop is strictly
+    /// worse than false-actionable for this user.
     /// </summary>
     public TriageVerdict ApplyAsymmetricBias(TriageStructuredOutput llm, string fullBody)
     {
@@ -173,31 +217,38 @@ public class TriagePipeline : ITriagePipeline
             llm.Confidence);
     }
 
-    async Task<TriageStructuredOutput?> CallL3Async(string commentBody, CancellationToken cancellationToken)
+    /// <summary>
+    /// Bias check looks at the comment body for <c>?</c> and @-mentions. We re-fetch the body
+    /// at agent-triage time to keep this self-contained — the QuickTriage call doesn't return
+    /// the body, and the agent may already have the content from its own tool use anyway.
+    /// </summary>
+    static string BodyForBiasCheck(GhNotification n)
+        => n.Subject.Title ?? "";
+
+    /// <summary>The user message the agent receives. Includes everything it needs to investigate.</summary>
+    static string BuildAgentInput(GhNotification n, BranchInfo branch)
     {
-        // Use a stable scratch dir under DataDir so claude's project state doesn't pollute
-        // real worktrees and gets cached across calls.
-        var cwd = Path.Combine(_options.DataDir, "triage-scratch");
-
-        var result = await _claude.RunHeadlessJsonAsync(
-            systemPrompt: _systemPrompt.Value,
-            userInput: commentBody,
-            schemaJson: _schema.Value,
-            model: _options.Triage.Model,
-            workingDirectory: cwd,
-            timeout: L3Timeout,
-            cancellationToken: cancellationToken);
-
-        if (result.IsError)
-            throw new InvalidOperationException($"claude reported is_error=true: {result.Result}");
-
-        if (result.StructuredOutput is null)
-            return null;
-
-        return JsonSerializer.Deserialize<TriageStructuredOutput>(
-            result.StructuredOutput.Value.GetRawText(),
-            JsonOpts);
+        var sb = new StringBuilder();
+        sb.AppendLine($"# GitHub notification");
+        sb.AppendLine($"- Repository: {n.Repository.FullName}");
+        sb.AppendLine($"- Type: {n.Subject.Type}");
+        sb.AppendLine($"- Reason: {n.Reason}");
+        sb.AppendLine($"- Title: {n.Subject.Title}");
+        if (branch.PrNumber is int pr) sb.AppendLine($"- PR: #{pr}");
+        if (branch.IssueNumber is int issue) sb.AppendLine($"- Issue: #{issue}");
+        sb.AppendLine($"- Branch: {branch.Branch}");
+        sb.AppendLine($"- Worktree (your cwd): {branch.Worktree}");
+        if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
+        {
+            sb.AppendLine($"- Latest comment URL (use `gh api` if you need the body): {n.Subject.LatestCommentUrl}");
+        }
+        sb.AppendLine();
+        sb.AppendLine("Triage this notification per your system prompt. If actionable, do meaningful prep using your tools, then return the JSON verdict.");
+        return sb.ToString();
     }
+
+    static string TruncateSummary(string s)
+        => string.IsNullOrEmpty(s) ? "(no summary)" : (s.Length <= 200 ? s : s[..200]);
 
     /// <summary>
     /// Strips GitHub quoted-reply lines (lines starting with <c>&gt;</c>) and the immediately
@@ -216,7 +267,6 @@ public class TriagePipeline : ITriagePipeline
             var line = lines[i];
             if (line.StartsWith('>'))
             {
-                // Eat consecutive quoted lines, then skip an immediately-following blank line.
                 while (i < lines.Length && lines[i].StartsWith('>'))
                     i++;
                 if (i < lines.Length && string.IsNullOrWhiteSpace(lines[i]))

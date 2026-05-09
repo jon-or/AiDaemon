@@ -70,6 +70,9 @@ public class TriagePipelineTests : IDisposable
         },
     };
 
+    static BranchInfo Branch() => new("ownerrez/orez", "16119-isdpvirtualproperty",
+        @"D:\git\orez.worktrees\16119-isdpvirtualproperty", PrNumber: null, IssueNumber: 16119);
+
     void StubComment(string body, string author = "alice")
     {
         _gh.Setup(g => g.GetCommentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
@@ -81,7 +84,7 @@ public class TriagePipelineTests : IDisposable
             });
     }
 
-    void StubL3(string action, double confidence, string why = "test", string summary = "")
+    void StubAgent(string action, double confidence, string why = "test", string summary = "")
     {
         var json = JsonSerializer.SerializeToElement(new
         {
@@ -94,78 +97,68 @@ public class TriagePipelineTests : IDisposable
         _claude.Setup(c => c.RunHeadlessJsonAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
             .ReturnsAsync(new ClaudeJsonResult(false, "", json, "end_turn", 100));
     }
 
-    // ---------- L1: author / type / reason ----------
+    // ==================== QuickTriage (L1 + L2) ====================
 
     [Fact]
-    public async Task L1_DropsUnsupportedSubjectType()
+    public async Task Quick_DropsUnsupportedSubjectType()
     {
-        var v = await _pipeline.TriageAsync(N(type: "CheckSuite"), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(type: "CheckSuite"), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("unsupported subject type", v.Why);
     }
 
     [Fact]
-    public async Task L1_DropsReasonNotInActionableList()
+    public async Task Quick_DropsReasonNotInActionableList()
     {
-        var v = await _pipeline.TriageAsync(N(reason: "subscribed"), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(reason: "subscribed"), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("ActionableReasons", v.Why);
     }
 
     [Fact]
-    public async Task L1_ReviewRequested_ShortcutsToActionableWithoutFetchingBody()
-    {
-        var v = await _pipeline.TriageAsync(N(type: "PullRequest", reason: "review_requested"), default);
-        Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.Equal("review_requested", v.Why);
-        _gh.Verify(g => g.GetCommentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        _claude.Verify(c => c.RunHeadlessJsonAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()),
-            Times.Never);
-    }
-
-    [Fact]
-    public async Task L1_DropsSelfAuthored()
+    public async Task Quick_DropsSelfAuthored()
     {
         StubComment("any body", author: "jon-or-ai");
-        var v = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("self-authored", v.Why);
     }
 
     [Fact]
-    public async Task L1_DropsBotAuthor()
+    public async Task Quick_DropsBotAuthor()
     {
         StubComment("any body", author: "dependabot[bot]");
-        var v = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("blocklisted bot author", v.Why);
     }
 
     [Fact]
-    public async Task L1_RateLimit_DropsAfterMaxPerDay()
+    public async Task Quick_RateLimit_DropsAfterMaxPerDay()
     {
-        StubComment("question?");
-        StubL3("actionable", 0.9);
+        StubComment("Question?");
 
         for (var i = 0; i < _options.Triage.MaxActionsPerThreadPerDay; i++)
         {
-            var ok = await _pipeline.TriageAsync(N(), default);
-            Assert.Equal(TriageAction.Actionable, ok.Action);
+            var ok = await _pipeline.QuickTriageAsync(N(), default);
+            // Under the cap and past L2 → null (continue to L3).
+            Assert.Null(ok);
         }
 
-        var capped = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Drop, capped.Action);
+        var capped = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(capped);
+        Assert.Equal(TriageAction.Drop, capped!.Action);
         Assert.Contains("rate limit", capped.Why, StringComparison.OrdinalIgnoreCase);
     }
-
-    // ---------- L2: regex content filter ----------
 
     [Theory]
     [InlineData("lgtm")]
@@ -173,23 +166,33 @@ public class TriagePipelineTests : IDisposable
     [InlineData("  thanks  ")]
     [InlineData("approved")]
     [InlineData("👍")]
-    public async Task L2_DropsNoiseRegex(string body)
+    public async Task Quick_DropsNoiseRegex(string body)
     {
         StubComment(body);
-        var v = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
     }
 
     [Fact]
-    public async Task L2_StripsQuotedRepliesBeforeMatching()
+    public async Task Quick_StripsQuotedRepliesBeforeMatching()
     {
-        // The body has a quoted-reply followed by the actual content "lgtm" — should still drop.
         var body = "> earlier text\n> more quoted text\n\nlgtm";
         StubComment(body);
-        var v = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Drop, v.Action);
+        var v = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
+    }
+
+    [Fact]
+    public async Task Quick_ReturnsNull_WhenL1AndL2DontDecide()
+    {
+        // Real, substantive comment body that isn't noise — should bubble up to L3.
+        StubComment("can you bump the timeout in foo.cs to 30s?");
+        var v = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.Null(v);
     }
 
     [Fact]
@@ -206,133 +209,106 @@ public class TriagePipelineTests : IDisposable
         Assert.Equal("actual", TriagePipeline.StripQuotedReplies(input));
     }
 
+    // ==================== AgentTriage (L3) ====================
+
     [Fact]
-    public async Task L2_DoesNotMatchRealBodyWithNoiseSubstrings()
+    public async Task Agent_RunsClaudeInWorktreeWithSessionIdAndBypassPermissions()
     {
-        // "thanks" embedded in a longer body shouldn't match the noise regex.
-        StubComment("thanks for the patch — but can you also handle the timeout case?");
-        StubL3("actionable", 0.95);
-        var v = await _pipeline.TriageAsync(N(), default);
+        StubAgent("actionable", 0.95);
+
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
+
         Assert.Equal(TriageAction.Actionable, v.Action);
+        Assert.False(string.IsNullOrEmpty(v.SessionId));
+
+        _claude.Verify(c => c.RunHeadlessJsonAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(),
+                @"D:\git\orez.worktrees\16119-isdpvirtualproperty",  // worktree as cwd
+                It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>(),
+                It.Is<string?>(s => !string.IsNullOrEmpty(s)),  // session-id set
+                "bypassPermissions"),
+            Times.Once);
     }
 
-    // ---------- L3: LLM call + asymmetric bias ----------
-
     [Fact]
-    public async Task L3_HighConfidenceDrop_NoQuestion_NoMention_HonoredAsDrop()
+    public async Task Agent_HighConfidenceDrop_WithCleanSubject_HonoredAsDrop()
     {
-        StubComment("Just FYI, deploy went through last night.");
-        StubL3("drop", 0.95, why: "status update");
+        StubAgent("drop", 0.95, why: "status update");
+        // n.Subject.Title is "Some thread" — no `?`, no @-mention.
 
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Drop, v.Action);
     }
 
     [Fact]
-    public async Task L3_LowConfidenceDrop_UpgradedToActionable()
+    public async Task Agent_LowConfidenceDrop_UpgradedToActionable()
     {
-        StubComment("Looks fine to me.");
-        StubL3("drop", 0.6, why: "borderline");
+        StubAgent("drop", 0.6, why: "borderline");
 
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
         Assert.Contains("low-confidence", v.Why);
     }
 
     [Fact]
-    public async Task L3_DropWithQuestionMark_UpgradedToActionable()
+    public async Task Agent_ActionableNotDemoted_RegardlessOfConfidence()
     {
-        StubComment("Is the cutover scheduled for tomorrow?");
-        StubL3("drop", 0.95, why: "rhetorical");
+        StubAgent("actionable", 0.4, why: "low-conf actionable");
 
-        var v = await _pipeline.TriageAsync(N(), default);
-
-        Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.Contains("has-question", v.Why);
-    }
-
-    [Fact]
-    public async Task L3_DropWithAtMention_UpgradedToActionable()
-    {
-        StubComment("Hey @jon-or-ai, fyi this looks correct.");
-        StubL3("drop", 0.95, why: "fyi-only");
-
-        var v = await _pipeline.TriageAsync(N(), default);
-
-        Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.Contains("at-mention", v.Why);
-    }
-
-    [Fact]
-    public async Task L3_ActionableNotDemoted_RegardlessOfConfidence()
-    {
-        StubComment("Could you bump the timeout?");
-        StubL3("actionable", 0.4, why: "low-conf actionable still actionable");
-
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
         Assert.DoesNotContain("upgraded", v.Why);
     }
 
     [Fact]
-    public async Task L3_Throws_FallsBackToActionable()
+    public async Task Agent_Throws_FallsBackToActionableWithSessionId()
     {
-        StubComment("non-trivial body");
         _claude.Setup(c => c.RunHeadlessJsonAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
             .ThrowsAsync(new TimeoutException("test"));
 
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.Contains("L3 error", v.Why);
+        Assert.Contains("agent error", v.Why);
+        Assert.False(string.IsNullOrEmpty(v.SessionId));
     }
 
     [Fact]
-    public async Task L3_IsErrorTrue_FallsBackToActionable()
+    public async Task Agent_IsErrorTrue_FallsBackToActionable()
     {
-        StubComment("non-trivial body");
         _claude.Setup(c => c.RunHeadlessJsonAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
             .ReturnsAsync(new ClaudeJsonResult(true, "Not logged in", null, null, 50));
 
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
     }
 
     [Fact]
-    public async Task L3_NoStructuredOutput_FallsBackToActionable()
+    public async Task Agent_NoStructuredOutput_FallsBackToActionable()
     {
-        StubComment("non-trivial body");
         _claude.Setup(c => c.RunHeadlessJsonAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
             .ReturnsAsync(new ClaudeJsonResult(false, "", null, "end_turn", 50));
 
-        var v = await _pipeline.TriageAsync(N(), default);
+        var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
-    }
-
-    [Fact]
-    public async Task L3_EmptyBody_DefaultsToActionableWithoutCallingClaude()
-    {
-        StubComment(""); // empty body
-        var v = await _pipeline.TriageAsync(N(), default);
-        Assert.Equal(TriageAction.Actionable, v.Action);
-        _claude.Verify(c => c.RunHeadlessJsonAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
-                It.IsAny<CancellationToken>()),
-            Times.Never);
     }
 }

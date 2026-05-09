@@ -141,10 +141,10 @@ public class Worker : BackgroundService
         var actionable = 0;
         var coalesced = 0;
 
-        // Branches we've already dispatched (or would dispatch in Phase 4) this tick. A second
+        // Branches we've already dispatched (or run agent triage for) this tick. A second
         // notification on the same branch within one poll gets logged + recorded but doesn't
-        // re-fire the spawn / heads-up path. Cross-tick reuse is handled separately by the
-        // branches table's RcActive state in Phase 4.
+        // re-fire the agent-triage / dispatch path. Cross-tick reuse is handled by the
+        // branches table's RcActive state via the dispatcher.
         var dispatchedThisTick = new HashSet<string>(StringComparer.Ordinal);
 
         await foreach (var n in _poller.PollAsync(cancellationToken))
@@ -156,79 +156,115 @@ public class Worker : BackgroundService
                 "notification thread={ThreadId} repo={Repo} type={Type} reason={Reason} title={Title}",
                 n.Id, n.Repository.FullName, n.Subject.Type, n.Reason, n.Subject.Title);
 
-            TriageVerdict verdict;
+            // ---------- L1 + L2: cheap deterministic filters ----------
+            TriageVerdict? quick;
             try
             {
-                verdict = await _triage.TriageAsync(n, cancellationToken);
+                quick = await _triage.QuickTriageAsync(n, cancellationToken);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "triage threw thread={ThreadId} — skipping", n.Id);
+                _logger.LogError(ex, "quick triage threw thread={ThreadId} — skipping", n.Id);
                 continue;
+            }
+
+            if (quick is { Action: TriageAction.Drop })
+            {
+                dropped++;
+                _logger.LogInformation(
+                    "verdict thread={ThreadId} action=Drop why={Why} (L1/L2)",
+                    n.Id, quick.Why);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"dropped:{quick.Why}", cancellationToken);
+                continue;
+            }
+
+            // ---------- Resolve branch (needed for agent triage AND dispatch) ----------
+            BranchInfo? branch = null;
+            try
+            {
+                branch = await _resolver.ResolveAsync(n, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
+            }
+
+            if (branch == null)
+            {
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, "unresolved", cancellationToken);
+                continue;
+            }
+
+            _logger.LogInformation(
+                "resolved thread={ThreadId} branch={Branch} worktree={Worktree} pr={Pr} issue={Issue}",
+                n.Id, branch.Branch, branch.Worktree, branch.PrNumber, branch.IssueNumber);
+
+            // ---------- Within-tick coalesce: only one agent run + dispatch per branch ----------
+            if (!dispatchedThisTick.Add(branch.Key))
+            {
+                coalesced++;
+                _logger.LogInformation(
+                    "coalesced thread={ThreadId} branch={Branch} (already dispatched this tick)",
+                    n.Id, branch.Key);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"coalesced:{branch.Key}", cancellationToken);
+                continue;
+            }
+
+            // ---------- L3: agent triage (and the actual research/fix work) in the worktree ----------
+            TriageVerdict verdict;
+            if (quick is { Action: TriageAction.Actionable })
+            {
+                // Quick triage produced a definitive actionable (e.g. a future shortcut). Treat
+                // it as final, with no agent session. The dispatcher will fresh-spawn RC.
+                verdict = quick;
+            }
+            else
+            {
+                try
+                {
+                    verdict = await _triage.AgentTriageAsync(n, branch, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "agent triage threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
+                    await _stateStore.MarkProcessedAsync(n.Id, commentId, $"failed:agent-triage:{branch.Key}", cancellationToken);
+                    continue;
+                }
             }
 
             string outcome;
             if (verdict.Action == TriageAction.Drop)
             {
                 dropped++;
-                outcome = $"dropped:{verdict.Why}";
                 _logger.LogInformation(
-                    "verdict thread={ThreadId} action=Drop why={Why}",
+                    "verdict thread={ThreadId} action=Drop why={Why} (L3)",
                     n.Id, verdict.Why);
+                outcome = $"dropped:{verdict.Why}";
             }
             else
             {
                 actionable++;
                 _logger.LogInformation(
-                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
-                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence);
+                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2} sid={Sid}",
+                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence, verdict.SessionId ?? "(none)");
 
-                BranchInfo? branch = null;
+                DispatchOutcome dispatchOutcome;
                 try
                 {
-                    branch = await _resolver.ResolveAsync(n, cancellationToken);
+                    dispatchOutcome = await _dispatcher.DispatchAsync(branch, n, verdict, cancellationToken);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
+                    _logger.LogError(ex, "dispatch threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
+                    dispatchOutcome = DispatchOutcome.Failed;
                 }
 
-                if (branch == null)
+                outcome = dispatchOutcome switch
                 {
-                    outcome = "actionable:unresolved";
-                }
-                else if (!dispatchedThisTick.Add(branch.Key))
-                {
-                    coalesced++;
-                    outcome = $"actionable:coalesced:{branch.Key}";
-                    _logger.LogInformation(
-                        "coalesced thread={ThreadId} branch={Branch} (already dispatched this tick)",
-                        n.Id, branch.Key);
-                }
-                else
-                {
-                    _logger.LogInformation(
-                        "resolved thread={ThreadId} branch={Branch} worktree={Worktree} pr={Pr} issue={Issue}",
-                        n.Id, branch.Branch, branch.Worktree, branch.PrNumber, branch.IssueNumber);
-
-                    DispatchOutcome dispatchOutcome;
-                    try
-                    {
-                        dispatchOutcome = await _dispatcher.DispatchAsync(branch, n, verdict, cancellationToken);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "dispatch threw thread={ThreadId} branch={Branch}", n.Id, branch.Key);
-                        dispatchOutcome = DispatchOutcome.Failed;
-                    }
-
-                    outcome = dispatchOutcome switch
-                    {
-                        DispatchOutcome.Spawned => $"spawned:{branch.Key}",
-                        DispatchOutcome.HeadsUp => $"heads_up:{branch.Key}",
-                        _ => $"failed:{branch.Key}",
-                    };
-                }
+                    DispatchOutcome.Spawned => $"spawned:{branch.Key}",
+                    DispatchOutcome.HeadsUp => $"heads_up:{branch.Key}",
+                    _ => $"failed:{branch.Key}",
+                };
             }
 
             await _stateStore.MarkProcessedAsync(n.Id, commentId, outcome, cancellationToken);

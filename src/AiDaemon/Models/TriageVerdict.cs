@@ -12,13 +12,15 @@ public record TriageVerdict(
     TriageAction Action,
     string Why,
     string Summary,
-    double Confidence)
+    double Confidence,
+    string? SessionId = null)
 {
     public static TriageVerdict Drop(string why, string summary = "", double confidence = 1.0)
         => new(TriageAction.Drop, why, summary, confidence);
 
-    public static TriageVerdict Actionable(string why, string summary = "", double confidence = 1.0)
-        => new(TriageAction.Actionable, why, summary, confidence);
+    public static TriageVerdict Actionable(string why, string summary = "", double confidence = 1.0,
+        string? sessionId = null)
+        => new(TriageAction.Actionable, why, summary, confidence, sessionId);
 }
 
 /// <summary>The shape claude returns under "structured_output" when triaging.</summary>

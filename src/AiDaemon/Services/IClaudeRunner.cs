@@ -11,8 +11,10 @@ public interface IClaudeRunner
     /// <param name="userInput">The user-message argument (the comment body, etc.).</param>
     /// <param name="schemaJson">The JSON schema string for <c>--json-schema</c>.</param>
     /// <param name="model">Model alias (e.g. "haiku") for <c>--model</c>.</param>
-    /// <param name="workingDirectory">Cwd for the subprocess. Pick a stable scratch dir to avoid polluting real worktrees.</param>
+    /// <param name="workingDirectory">Cwd for the subprocess.</param>
     /// <param name="timeout">Per-call timeout. The process tree is killed on expiry.</param>
+    /// <param name="sessionId">When non-null, the call uses <c>--session-id &lt;sessionId&gt;</c> and persists the conversation JSONL so a future <c>claude --resume</c> can pick it up. When null, <c>--no-session-persistence</c> is set so the call leaves no JSONL on disk.</param>
+    /// <param name="permissionMode">Optional <c>--permission-mode</c> value (e.g. <c>"bypassPermissions"</c>) — required if <paramref name="userInput"/> is expected to drive tool use.</param>
     Task<ClaudeJsonResult> RunHeadlessJsonAsync(
         string systemPrompt,
         string userInput,
@@ -20,7 +22,9 @@ public interface IClaudeRunner
         string model,
         string workingDirectory,
         TimeSpan timeout,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        string? sessionId = null,
+        string? permissionMode = null);
 }
 
 /// <summary>

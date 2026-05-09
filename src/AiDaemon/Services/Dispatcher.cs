@@ -85,10 +85,14 @@ public class Dispatcher : IDispatcher
             ResetRcFields(rec);
         }
 
-        // Case 3: spawn from Idle. First spawn passes null sessionId (claude assigns a fresh
-        // UUID and we capture it from the registry). Respawn after a previous death passes the
-        // sessionId we recorded so the conversation history is preserved.
-        var seedSid = string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId;
+        // Case 3: spawn from Idle.
+        //   * If triage just produced a session (verdict.SessionId set), resume THAT — the
+        //     user's RC session inherits the agent's research/fix transcript.
+        //   * Otherwise, fall back to the previously stored sessionId (cross-tick resume).
+        //   * Otherwise, fresh spawn (claude assigns a UUID; we capture it from the registry).
+        var seedSid = !string.IsNullOrEmpty(verdict.SessionId)
+            ? verdict.SessionId
+            : (string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId);
 
         RcAttachment attachment;
         try

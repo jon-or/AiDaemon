@@ -28,7 +28,9 @@ public class ClaudeRunner : IClaudeRunner
         string model,
         string workingDirectory,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? sessionId = null,
+        string? permissionMode = null)
     {
         Directory.CreateDirectory(workingDirectory);
 
@@ -42,9 +44,25 @@ public class ClaudeRunner : IClaudeRunner
             "--output-format", "json",
             "--json-schema", schemaJson,
             "--system-prompt", systemPrompt,
-            "--no-session-persistence",
-            userInput,
         };
+
+        if (!string.IsNullOrEmpty(sessionId))
+        {
+            args.Add("--session-id");
+            args.Add(sessionId);
+        }
+        else
+        {
+            args.Add("--no-session-persistence");
+        }
+
+        if (!string.IsNullOrEmpty(permissionMode))
+        {
+            args.Add("--permission-mode");
+            args.Add(permissionMode);
+        }
+
+        args.Add(userInput);
 
         using var perCallCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         perCallCts.CancelAfter(timeout);
