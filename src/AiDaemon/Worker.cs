@@ -153,7 +153,7 @@ public class Worker : BackgroundService
         _logger.LogInformation("AiDaemon worker stopping");
     }
 
-    async Task TickAsync(CancellationToken cancellationToken)
+    internal async Task TickAsync(CancellationToken cancellationToken)
     {
         var seen = 0;
         var dropped = 0;

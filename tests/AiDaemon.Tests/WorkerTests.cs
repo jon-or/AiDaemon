@@ -1,0 +1,301 @@
+using AiDaemon.Configuration;
+using AiDaemon.Models;
+using AiDaemon.Services;
+using AiDaemon.Storage;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Moq;
+
+namespace AiDaemon.Tests;
+
+/// <summary>
+/// Coverage for <see cref="Worker.TickAsync"/> — the orchestration spine. The two-pass
+/// shape (poll → L1/L2 → resolve → group → L3 → dispatch per branch) and the rate-limit /
+/// MarkProcessed invariants are easy to break with a refactor; the unit tests on individual
+/// services don't catch wiring bugs.
+/// </summary>
+public class WorkerTests
+{
+    readonly Mock<INotificationPoller> _poller = new(MockBehavior.Strict);
+    readonly Mock<ITriagePipeline> _triage = new(MockBehavior.Strict);
+    readonly Mock<IBranchResolver> _resolver = new(MockBehavior.Strict);
+    readonly Mock<IDispatcher> _dispatcher = new(MockBehavior.Strict);
+    readonly Mock<IStateStore> _store = new(MockBehavior.Strict);
+    readonly Mock<IHostApplicationLifetime> _lifetime = new();
+    readonly DaemonOptions _options = new()
+    {
+        AiUserLogin = "jon-or-ai",
+        DataDir = Path.Combine(Path.GetTempPath(), "aidaemon-worker-tests"),
+        WorktreeRoot = @"C:\Users\Jon\worktrees",
+        RepoAllowlist = new() { "ownerrez/orez" },
+    };
+
+    Worker Build() => new(
+        NullLogger<Worker>.Instance,
+        Options.Create(_options),
+        _lifetime.Object,
+        _store.Object,
+        _poller.Object,
+        _triage.Object,
+        _resolver.Object,
+        _dispatcher.Object);
+
+    static GhNotification N(string id, string commentUrl, DateTimeOffset? updated = null) => new()
+    {
+        Id = id,
+        Reason = "mention",
+        Unread = true,
+        UpdatedAt = updated ?? DateTimeOffset.UtcNow,
+        Repository = new GhRepositoryRef { FullName = "ownerrez/orez" },
+        Subject = new GhNotificationSubject
+        {
+            Title = $"Thread {id}",
+            Type = "Issue",
+            Url = $"https://api.github.com/repos/o/r/issues/{id}",
+            LatestCommentUrl = commentUrl,
+        },
+    };
+
+    static BranchInfo SameBranch() => new(
+        "ownerrez/orez", "16119-isdpvirtualproperty",
+        @"D:\git\orez.worktrees\16119-isdpvirtualproperty",
+        PrNumber: null, IssueNumber: 16119);
+
+    void StubPoller(params GhNotification[] items)
+    {
+        _poller.Setup(p => p.PollAsync(It.IsAny<CancellationToken>()))
+            .Returns(ToAsync(items));
+    }
+
+    static async IAsyncEnumerable<GhNotification> ToAsync(GhNotification[] items)
+    {
+        foreach (var n in items)
+        {
+            await Task.Yield();
+            yield return n;
+        }
+    }
+
+    [Fact]
+    public async Task Tick_GroupsTwoNotificationsForSameBranch_IntoOneAgentTriageAndOneDispatch()
+    {
+        // The central invariant the worker exists to enforce: N notifications resolving
+        // to one branch produce exactly one agent classification and one dispatch, even as
+        // each notification's MarkProcessed row is written individually.
+        var n1 = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-B", "https://api.github.com/repos/o/r/issues/comments/2");
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((GhNotification _, CancellationToken _) => (null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+
+        IReadOnlyList<NotificationWithBody>? capturedItems = null;
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) =>
+                capturedItems = items)
+            .ReturnsAsync(TriageVerdict.Actionable("go", "summary", 0.9));
+
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DispatchOutcome.Spawned);
+
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(s => s.IncrementRateLimitAsync(
+                It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        await Build().TickAsync(default);
+
+        // Exactly one agent triage saw both items.
+        _triage.Verify(t => t.AgentTriageAsync(
+            It.Is<IReadOnlyList<NotificationWithBody>>(x => x.Count == 2),
+            It.IsAny<BranchInfo>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+        Assert.NotNull(capturedItems);
+        Assert.Equal(2, capturedItems!.Count);
+
+        // Exactly one dispatch.
+        _dispatcher.Verify(d => d.DispatchAsync(
+            It.IsAny<BranchInfo>(),
+            It.Is<IReadOnlyList<NotificationWithBody>>(x => x.Count == 2),
+            It.IsAny<TriageVerdict>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Both notifications individually marked processed with spawned outcome.
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-A", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("spawned:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-B", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("spawned:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Rate limit charged once per unique thread on dispatch — not per L1 entry.
+        _store.Verify(s => s.IncrementRateLimitAsync("thread-A", It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.IncrementRateLimitAsync("thread-B", It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_QuickTriageThrows_MarksFailedAndContinues()
+    {
+        var n1 = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-B", "https://api.github.com/repos/o/r/issues/comments/2");
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(
+                It.Is<GhNotification>(g => g.Id == "thread-A"),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("gh hiccup"));
+        _triage.Setup(t => t.QuickTriageAsync(
+                It.Is<GhNotification>(g => g.Id == "thread-B"),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("L1 unsupported"), ""));
+
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        await Build().TickAsync(default);
+
+        // The throwing notification MUST be marked processed — otherwise the cursor advances
+        // past it and we lose the row forever.
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-A", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("failed:quick-triage:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // The other notification still gets handled normally.
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-B", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("dropped:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Resolver and downstream pieces never touched the throwing thread.
+        _resolver.Verify(r => r.ResolveAsync(It.Is<GhNotification>(g => g.Id == "thread-A"), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Tick_DispatchFailed_DoesNotChargeRateLimit()
+    {
+        // A failed dispatch should not consume the per-thread daily budget. Otherwise a
+        // flaky claude-spawn run would silently eat the user's actionable allowance.
+        var n = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        StubPoller(n);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TriageVerdict.Actionable("go", "x", 0.9));
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DispatchOutcome.Failed);
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        await Build().TickAsync(default);
+
+        _store.Verify(s => s.IncrementRateLimitAsync(
+            It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-A", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("failed:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_AgentTriageDrop_MarksAllItemsDropped_WithoutDispatch()
+    {
+        var n1 = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-B", "https://api.github.com/repos/o/r/issues/comments/2");
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TriageVerdict.Drop("noise"));
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        await Build().TickAsync(default);
+
+        _dispatcher.Verify(d => d.DispatchAsync(
+            It.IsAny<BranchInfo>(),
+            It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+            It.IsAny<TriageVerdict>(),
+            It.IsAny<CancellationToken>()),
+            Times.Never);
+        _store.Verify(s => s.IncrementRateLimitAsync(
+            It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        foreach (var id in new[] { "thread-A", "thread-B" })
+            _store.Verify(s => s.MarkProcessedAsync(
+                id, It.IsAny<string>(),
+                It.Is<string>(o => o.StartsWith("dropped:")),
+                It.IsAny<CancellationToken>()),
+                Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_ResolverThrows_MarksFailedResolveAndSkips()
+    {
+        var n = N("thread-X", "https://api.github.com/repos/o/r/issues/comments/9");
+        StubPoller(n);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("git wedged"));
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        await Build().TickAsync(default);
+
+        _store.Verify(s => s.MarkProcessedAsync(
+            "thread-X", It.IsAny<string>(),
+            It.Is<string>(o => o.StartsWith("failed:resolve:")),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+        _triage.Verify(t => t.AgentTriageAsync(
+            It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+            It.IsAny<BranchInfo>(),
+            It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+}
