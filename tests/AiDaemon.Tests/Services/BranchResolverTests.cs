@@ -67,14 +67,16 @@ public class BranchResolverTests
             .ReturnsAsync(new ProcessResult(exit, branch + "\n", ""));
     }
 
-    [Fact]
-    public async Task ParseLastSegmentInt_HandlesNumericTrailingSegments()
+    [Theory]
+    [InlineData("https://api.github.com/repos/o/r/issues/123", 123)]
+    [InlineData("https://api.github.com/repos/o/r/pulls/7", 7)]
+    // Trailing slash should be tolerated.
+    [InlineData("https://x.example/y/99/", 99)]
+    [InlineData("", null)]
+    [InlineData("https://x.example/y/abc", null)]
+    public void ParseLastSegmentInt_HandlesNumericTrailingSegments(string url, int? expected)
     {
-        Assert.Equal(123, BranchResolver.ParseLastSegmentInt("https://api.github.com/repos/o/r/issues/123"));
-        Assert.Equal(7, BranchResolver.ParseLastSegmentInt("https://api.github.com/repos/o/r/pulls/7"));
-        Assert.Equal(99, BranchResolver.ParseLastSegmentInt("https://x.example/y/99/"));
-        Assert.Null(BranchResolver.ParseLastSegmentInt(""));
-        Assert.Null(BranchResolver.ParseLastSegmentInt("https://x.example/y/abc"));
+        Assert.Equal(expected, BranchResolver.ParseLastSegmentInt(url));
     }
 
     [Fact]
