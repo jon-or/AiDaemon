@@ -13,8 +13,9 @@ public interface ITriagePipeline
     /// short-circuit actionable). It is <c>null</c> when the notification needs the agent
     /// triage (<see cref="AgentTriageAsync"/>) to make the call.
     /// </para>
-    /// Side effect: increments the per-thread daily rate-limit counter when the pipeline
-    /// reaches the count check.
+    /// Read-only with respect to the rate-limit table — drops when the per-thread daily
+    /// counter is already at or above the cap. The increment is the worker's responsibility,
+    /// applied only after a successful dispatch so dropped notifications don't burn budget.
     /// </summary>
     Task<(TriageVerdict? Verdict, string CommentBody)> QuickTriageAsync(
         GhNotification notification,

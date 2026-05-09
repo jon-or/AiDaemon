@@ -154,21 +154,47 @@ public class TriagePipelineTests : IDisposable
     }
 
     [Fact]
-    public async Task Quick_RateLimit_DropsAfterMaxPerDay()
+    public async Task Quick_RateLimit_DropsWhenCounterAtOrAboveCap()
     {
+        // The pipeline does NOT touch the rate-limit table — only the worker does on
+        // successful dispatch. So pre-seed the table directly to simulate "this thread has
+        // already received its budget today" and assert the next QuickTriage drops at L1.
         StubComment("Question?");
-
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
         for (var i = 0; i < _options.Triage.MaxActionsPerThreadPerDay; i++)
-        {
-            var (ok, _) = await _pipeline.QuickTriageAsync(N(), default);
-            // Under the cap and past L2 → null (continue to L3).
-            Assert.Null(ok);
-        }
+            await _store.IncrementRateLimitAsync("thread-1", today, default);
 
-        var (capped, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (capped, body) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(capped);
         Assert.Equal(TriageAction.Drop, capped!.Action);
         Assert.Contains("rate limit", capped.Why, StringComparison.OrdinalIgnoreCase);
+        // L1 short-circuits before fetching the comment — no body should be returned.
+        Assert.Equal("", body);
+        _gh.Verify(g => g.GetCommentAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Quick_DroppedAtL2_DoesNotChargeRateLimit()
+    {
+        // The increment moved to the dispatch path, so L2-dropped notifications must not
+        // bump the per-thread counter. Otherwise a thread of "lgtm" comments could starve
+        // the day's budget without ever producing a dispatch.
+        StubComment("lgtm");
+        await _pipeline.QuickTriageAsync(N(), default);
+
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        Assert.Equal(0, await _store.GetRateLimitAsync("thread-1", today, default));
+    }
+
+    [Fact]
+    public async Task Quick_PassedToL3_DoesNotChargeRateLimit()
+    {
+        StubComment("substantive question that needs the agent");
+        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        Assert.Null(v);
+
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        Assert.Equal(0, await _store.GetRateLimitAsync("thread-1", today, default));
     }
 
     [Theory]

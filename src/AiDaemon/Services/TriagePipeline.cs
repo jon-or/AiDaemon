@@ -64,12 +64,26 @@ public class TriagePipeline : ITriagePipeline
 
     public async Task<(TriageVerdict? Verdict, string CommentBody)> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
     {
-        // ---------- L1: author / type / reason / rate ----------
+        // ---------- L1: type / reason / rate / author ----------
         if (!SupportedSubjectTypes.Contains(n.Subject.Type))
             return (TriageVerdict.Drop($"unsupported subject type: {n.Subject.Type}"), "");
 
         if (!_actionableReasons.Contains(n.Reason))
             return (TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons"), "");
+
+        // Rate-limit is checked read-only here — the count records dispatched actions, not
+        // notifications considered, so the increment lives at the dispatch decision in the
+        // worker. Reading first means rate-limited threads don't even pay for the comment fetch.
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var currentCount = await _store.GetRateLimitAsync(n.Id, today, cancellationToken);
+        if (currentCount >= _options.Triage.MaxActionsPerThreadPerDay)
+        {
+            _logger.LogInformation(
+                "rate-limit drop thread={ThreadId} count={Count} max={Max}",
+                n.Id, currentCount, _options.Triage.MaxActionsPerThreadPerDay);
+            return (TriageVerdict.Drop(
+                $"thread daily rate limit ({currentCount}/{_options.Triage.MaxActionsPerThreadPerDay})"), "");
+        }
 
         // L1 author check requires the comment body. Fetch once; the body is also returned
         // so callers can pass it through to the agent without re-fetching the same URL.
@@ -86,19 +100,6 @@ public class TriagePipeline : ITriagePipeline
 
         if (!string.IsNullOrEmpty(author) && _botBlocklist.Contains(author))
             return (TriageVerdict.Drop($"blocklisted bot author: {author}"), body);
-
-        // Rate-limit check is the last L1 step so we don't burn budget on notifications that
-        // would have been dropped above.
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        var newCount = await _store.IncrementRateLimitAsync(n.Id, today, cancellationToken);
-        if (newCount > _options.Triage.MaxActionsPerThreadPerDay)
-        {
-            _logger.LogInformation(
-                "rate-limit drop thread={ThreadId} count={Count} max={Max}",
-                n.Id, newCount, _options.Triage.MaxActionsPerThreadPerDay);
-            return (TriageVerdict.Drop(
-                $"thread daily rate limit ({newCount}/{_options.Triage.MaxActionsPerThreadPerDay})"), body);
-        }
 
         // ---------- L2: regex content filter ----------
         var stripped = StripQuotedReplies(body);

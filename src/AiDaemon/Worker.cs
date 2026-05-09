@@ -288,6 +288,16 @@ public class Worker : BackgroundService
             else
                 actionable++;
 
+            // Charge the per-thread rate limit only when the daemon actually took action.
+            // Dropped or failed dispatches don't consume budget, so noisy LGTM threads can't
+            // squeeze out the substantive comment that lands later in the day.
+            if (dispatchOutcome != DispatchOutcome.Failed)
+            {
+                var today = DateOnly.FromDateTime(DateTime.UtcNow);
+                foreach (var threadId in batch.Items.Select(i => i.Notification.Id).Distinct(StringComparer.Ordinal))
+                    await _stateStore.IncrementRateLimitAsync(threadId, today, cancellationToken);
+            }
+
             var outcome = dispatchOutcome switch
             {
                 DispatchOutcome.Spawned => $"spawned:{branchKey}",
