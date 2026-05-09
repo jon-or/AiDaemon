@@ -41,10 +41,25 @@ public class Worker : BackgroundService
 
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        _instanceMutex = new Mutex(true, @"Global\AiDaemon", out var owned);
+        bool owned;
+        try
+        {
+            _instanceMutex = new Mutex(true, @"Global\AiDaemon", out owned);
+        }
+        catch (AbandonedMutexException)
+        {
+            // A prior instance died without releasing. .NET marks the mutex acquired by us;
+            // proceed as if we got it cleanly.
+            _logger.LogWarning("recovered abandoned Global\\AiDaemon mutex from a prior crashed instance");
+            _instanceMutex = new Mutex(true, @"Global\AiDaemon", out owned);
+        }
 
         if (!owned)
         {
+            // We don't own the handle, so we must not retain it — StopAsync would call
+            // ReleaseMutex and throw ApplicationException.
+            _instanceMutex.Dispose();
+            _instanceMutex = null;
             _logger.LogCritical("Another instance of AiDaemon is already running. Exiting.");
             _lifetime.StopApplication();
             return;
@@ -56,7 +71,7 @@ public class Worker : BackgroundService
         {
             await _dispatcher.ReconcileOnStartupAsync(cancellationToken);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "startup reconciliation failed — continuing");
         }
@@ -64,8 +79,14 @@ public class Worker : BackgroundService
         await base.StartAsync(cancellationToken);
     }
 
-    public override Task StopAsync(CancellationToken cancellationToken)
+    public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        // Release the mutex AFTER the host has signalled stoppingToken and waited for
+        // ExecuteAsync to unwind. Releasing earlier would let a fast-restarting second
+        // instance acquire the mutex during our shutdown grace period — two daemons
+        // running concurrently against the same state store and worktrees.
+        await base.StopAsync(cancellationToken);
+
         try
         {
             _instanceMutex?.ReleaseMutex();
@@ -76,8 +97,6 @@ public class Worker : BackgroundService
 
         _instanceMutex?.Dispose();
         _instanceMutex = null;
-
-        return base.StopAsync(cancellationToken);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
