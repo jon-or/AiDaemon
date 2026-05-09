@@ -173,6 +173,13 @@ public class BranchResolver : IBranchResolver
 
     async Task<string?> ReadCurrentBranchAsync(string worktree, CancellationToken cancellationToken)
     {
+        // `git symbolic-ref --short HEAD` is the precise question we want to ask: "what
+        // branch is HEAD pointing at?" In a detached state (mid-rebase, mid-bisect, mid-
+        // checkout-commit) it exits 128 with stderr "fatal: ref HEAD is not a symbolic
+        // ref" and we report null — exactly the "transitional, skip" semantic the
+        // worker needs. The older `git rev-parse --abbrev-ref HEAD` returns the literal
+        // string "HEAD" with exit 0 in that case, which then trips the "branch mismatch"
+        // warning even though the worktree just happens to be in flight.
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(GitTimeout);
 
@@ -180,7 +187,7 @@ public class BranchResolver : IBranchResolver
         {
             var result = await _runner.RunAsync(
                 "git",
-                new[] { "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD" },
+                new[] { "-C", worktree, "symbolic-ref", "--short", "HEAD" },
                 cancellationToken: cts.Token);
 
             return result.Succeeded ? result.Stdout.Trim() : null;
@@ -188,7 +195,7 @@ public class BranchResolver : IBranchResolver
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             _logger.LogWarning(
-                "git rev-parse in {Worktree} did not return within {Timeout}s — treating as unresolved",
+                "git symbolic-ref in {Worktree} did not return within {Timeout}s — treating as unresolved",
                 worktree, GitTimeout.TotalSeconds);
             return null;
         }

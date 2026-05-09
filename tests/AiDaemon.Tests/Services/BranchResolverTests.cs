@@ -58,8 +58,8 @@ public class BranchResolverTests
         _runner.Setup(r => r.RunAsync(
                 "git",
                 It.Is<IReadOnlyList<string>>(a =>
-                    a.Count >= 4 && a[0] == "-C" && a[1] == worktree
-                    && a[2] == "rev-parse" && a[3] == "--abbrev-ref"),
+                    a.Count >= 5 && a[0] == "-C" && a[1] == worktree
+                    && a[2] == "symbolic-ref" && a[3] == "--short" && a[4] == "HEAD"),
                 It.IsAny<string?>(),
                 It.IsAny<IReadOnlyDictionary<string, string?>?>(),
                 It.IsAny<string?>(),
@@ -132,13 +132,38 @@ public class BranchResolverTests
     }
 
     [Fact]
-    public async Task Issue_GitRevParseFails_ReturnsNull()
+    public async Task Issue_GitSymbolicRefFails_ReturnsNull()
     {
         var worktree = @"C:\Users\Jon\worktrees\16119-isdpvirtualproperty";
         _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
         _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
             .Returns(new[] { worktree });
         StubGitBranch(worktree, "", exit: 128);
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+        Assert.Null(got);
+    }
+
+    [Fact]
+    public async Task Issue_DetachedHead_ReturnsNullInsteadOfBranchMismatchWarning()
+    {
+        // Mid-rebase / mid-bisect: `git symbolic-ref --short HEAD` exits 128 because HEAD
+        // is not a symbolic ref. The worktree is in a transitional state and the daemon
+        // should skip cleanly rather than dispatch against the resolved branch or warn
+        // about a "mismatch" between expectations.
+        var worktree = @"C:\Users\Jon\worktrees\16119-isdpvirtualproperty";
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(new[] { worktree });
+        // Simulate the real-world stderr; the resolver only inspects the exit code.
+        _runner.Setup(r => r.RunAsync(
+                "git",
+                It.Is<IReadOnlyList<string>>(a => a.Contains("symbolic-ref")),
+                It.IsAny<string?>(),
+                It.IsAny<IReadOnlyDictionary<string, string?>?>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ProcessResult(128, "", "fatal: ref HEAD is not a symbolic ref\n"));
 
         var got = await Build().ResolveAsync(IssueN(16119), default);
         Assert.Null(got);
