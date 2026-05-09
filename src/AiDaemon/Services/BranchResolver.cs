@@ -9,6 +9,13 @@ namespace AiDaemon.Services;
 
 public class BranchResolver : IBranchResolver
 {
+    /// <summary>
+    /// Per-call cap on <c>git rev-parse</c>. The worktree's filesystem could hang
+    /// (network drive, antivirus lock, msysgit hiccup); a stuck git would otherwise
+    /// freeze the entire poll loop indefinitely.
+    /// </summary>
+    static readonly TimeSpan GitTimeout = TimeSpan.FromSeconds(15);
+
     readonly IGhClient _gh;
     readonly IFileSystem _fs;
     readonly IProcessRunner _runner;
@@ -166,12 +173,25 @@ public class BranchResolver : IBranchResolver
 
     async Task<string?> ReadCurrentBranchAsync(string worktree, CancellationToken cancellationToken)
     {
-        var result = await _runner.RunAsync(
-            "git",
-            new[] { "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD" },
-            cancellationToken: cancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(GitTimeout);
 
-        return result.Succeeded ? result.Stdout.Trim() : null;
+        try
+        {
+            var result = await _runner.RunAsync(
+                "git",
+                new[] { "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD" },
+                cancellationToken: cts.Token);
+
+            return result.Succeeded ? result.Stdout.Trim() : null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "git rev-parse in {Worktree} did not return within {Timeout}s — treating as unresolved",
+                worktree, GitTimeout.TotalSeconds);
+            return null;
+        }
     }
 
     string? FindWorktreeByPrefix(string numericPrefix)
