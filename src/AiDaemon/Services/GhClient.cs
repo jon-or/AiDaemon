@@ -78,11 +78,7 @@ public class GhClient : IGhClient
 
     async Task<ProcessResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
     {
-        var env = new Dictionary<string, string?>();
-        if (!string.IsNullOrWhiteSpace(_options.GhConfigDir))
-            env["GH_CONFIG_DIR"] = _options.GhConfigDir;
-
-        var result = await _runner.RunAsync(_options.GhPath, args, environment: env, cancellationToken: cancellationToken);
+        var result = await _runner.RunAsync(_options.GhPath, args, cancellationToken: cancellationToken);
 
         if (result.Succeeded)
             return result;
@@ -90,8 +86,8 @@ public class GhClient : IGhClient
         if (LooksLikeAuthFailure(result.Stderr))
         {
             _logger.LogError(
-                "gh auth failure (exit {ExitCode}). Run `gh auth login` inside GH_CONFIG_DIR={GhConfigDir}. Stderr: {Stderr}",
-                result.ExitCode, _options.GhConfigDir, result.Stderr.Trim());
+                "gh auth failure (exit {ExitCode}). Run `gh auth login` to authenticate. Stderr: {Stderr}",
+                result.ExitCode, result.Stderr.Trim());
             throw new GhAuthException(result.ExitCode, result.Stderr);
         }
 

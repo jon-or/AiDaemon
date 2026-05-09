@@ -9,7 +9,7 @@ Worktrees are assumed to already exist (one per active branch, named `<issue>-<s
 | Concern | Pick | Why |
 |---|---|---|
 | Host | .NET 10 Worker Service (`dotnet new worker`) | `AddWindowsService()` on `HostApplicationBuilder` gives proper service semantics in three lines |
-| GitHub API (all of it) | Shell out to `gh` CLI | Auth, token refresh, rate limits, User-Agent — all handled. Identity isolated via `GH_CONFIG_DIR`. No PAT management code in the daemon. |
+| GitHub API (all of it) | Shell out to `gh` CLI | Auth, token refresh, rate limits, User-Agent — all handled. Daemon uses your global `gh auth` (no PAT plumbing, no separate config dir). |
 | State | `Microsoft.Data.Sqlite` + `Dapper` | One file, ACID, three small tables |
 | Logging | Serilog + file sink | Rolling daily log under `C:\ProgramData\AiDaemon\logs` |
 | JSON | `System.Text.Json` | Built-in, fast, source-generated converters available |
@@ -71,7 +71,6 @@ daemon/
     "ClaudePath": "claude",
     "PowerShellPath": "powershell.exe",
     "GhPath": "gh",
-    "GhConfigDir": "C:\\Users\\Jon\\.config\\gh-ai",
     "RepoAllowlist": [ "ownerrez/orez" ],
     "ActionableReasons": [ "mention", "review_requested", "team_mention", "assign", "comment", "author" ],
     "BotAuthorBlocklist": [ "dependabot[bot]", "renovate[bot]", "github-actions[bot]" ],
@@ -105,15 +104,14 @@ Local-only config in `appsettings.Local.json` (gitignored, sits next to `appsett
 
 `Program.cs` adds it after the base file: `builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false)`. No environment-variable plumbing, no `LoadUserProfile` headache when running as a service — just a file the binary reads from its install directory. Add `appsettings.Local.json` to `.gitignore`.
 
-GitHub auth lives in `GhConfigDir` (a separate `gh` config dir authenticated as `jon-or-ai`). One-time setup:
+GitHub auth uses the global `gh` CLI auth — whatever `gh auth status` reports for the user the daemon runs as. `AiUserLogin` in config must match that account's login (it powers L1 self-drop). One-time setup if not already authed:
 
 ```powershell
-$env:GH_CONFIG_DIR = "C:\Users\Jon\.config\gh-ai"
-gh auth login   # pick GitHub.com, choose HTTPS, authenticate as jon-or-ai
+gh auth login   # pick GitHub.com, choose HTTPS, authenticate as the desired account
 gh auth status  # confirm
 ```
 
-Every `gh` invocation the daemon makes inherits `GH_CONFIG_DIR` from its process environment, so it always acts as the AI account. Your interactive `gh` (without that env var) is unaffected.
+If you want a dedicated AI identity (e.g. `jon-or-ai`) without taking over your interactive `gh`, log into that account via `gh auth login` and switch with `gh auth switch -u <login>` when you want to use it interactively as yourself. The daemon will use whichever account is currently active.
 
 ## Storage schema
 
@@ -167,7 +165,7 @@ Six phases. Each is shippable, runnable, and testable on its own.
 - [ ] Single-instance guard: `using var mutex = new Mutex(true, @"Global\AiDaemon", out var owned); if (!owned) { logger.LogCritical("Another instance running"); return; }`. Held for process lifetime. SQLite file lock is not enough.
 - [ ] Empty `Worker` that ticks every `PollIntervalSeconds` and logs. Loop body checks for `%ProgramData%\AiDaemon\PAUSED` first and skips the tick if present.
 - [ ] Create `appsettings.Local.json` (next to `appsettings.json`, gitignored) with `{ "Daemon": { "Ntfy": { "Topic": "<uuid>" } } }`. Wire it in `Program.cs` via `builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false)`.
-- [ ] One-time `gh auth login` inside `GhConfigDir` as `jon-or-ai`.
+- [ ] Confirm `gh auth status` reports the account `AiUserLogin` references (run `gh auth login` if not).
 
 **Acceptance:** `dotnet run` prints "tick" every minute. `Ctrl+C` shuts down cleanly.
 
@@ -176,7 +174,7 @@ Six phases. Each is shippable, runnable, and testable on its own.
 **Goal:** daemon polls `/notifications` via `gh api`, persists what it has seen, logs each new notification, doesn't re-process across restarts.
 
 - [ ] `IGhClient` / `GhClient` — the only thing in the daemon that talks to GitHub. Depends on `IProcessRunner`:
-  - `Task<T> ApiAsync<T>(string path, CancellationToken)`: invokes `IProcessRunner.RunAsync` with `gh`, args `["api", path]`, env `{ GH_CONFIG_DIR = options.GhConfigDir }`. Deserializes stdout to `T`. Throws on non-zero exit; on auth failure (401/403 in stderr), pushes a high-priority ntfy alert so Jon knows to refresh `gh auth login`.
+  - `Task<T> ApiAsync<T>(string path, CancellationToken)`: invokes `IProcessRunner.RunAsync` with `gh`, args `["api", path]`. Deserializes stdout to `T`. Throws on non-zero exit; on auth failure (401/403 in stderr, or `gh auth login` hint, or `GH_TOKEN` hint), pushes a high-priority ntfy alert so Jon knows to refresh `gh auth login`.
   - `Task<List<GhNotification>> ListNotificationsAsync(CancellationToken)`: calls `/notifications?participating=true&all=false`.
   - `Task MarkThreadReadAsync(string threadId, CancellationToken)`: `gh api -X PATCH /notifications/threads/<id>`.
   - `Task<CommentInfo> GetCommentAsync(string url, CancellationToken)`: dereferences `subject.latest_comment_url`.
@@ -327,7 +325,7 @@ Six phases. Each is shippable, runnable, and testable on its own.
   - Common greps: `"polled.*count="`, `"NtfyPusher"`, `"L3 verdict"`, `"escalated"`.
   - How to inspect state DB: `sqlite3 C:\ProgramData\AiDaemon\state.db "select * from branches"`.
   - How to fire a test ntfy: `Invoke-RestMethod -Uri "https://ntfy.sh/<topic>" -Method Post -Body "test"`.
-  - How to verify gh auth: `$env:GH_CONFIG_DIR="C:\Users\Jon\.config\gh-ai"; gh api /user`.
+  - How to verify gh auth: `gh auth status` and `gh api /user`.
   - How to pause / unpause: drop / remove `C:\ProgramData\AiDaemon\PAUSED`.
   - How to rotate ntfy topic: edit `appsettings.Local.json`, restart service, resubscribe in app.
   - **Warning: don't `claude --resume <sid>`** against a worktree containing `.daemon-active` — violates single-writer invariant.
@@ -401,7 +399,7 @@ Every loop iteration, every notification verdict, every dispatch outcome, every 
 
 ```
 1. Create `appsettings.Local.json` with the ntfy topic
-2. Run `gh auth login` inside `GhConfigDir` as `jon-or-ai` (one-time)
+2. Run `gh auth login` (one-time) as the account `AiUserLogin` references
 3. dotnet run --project src/AiDaemon
 4. Subscribe to <topic> in the ntfy app on your phone
 5. From your *human* GitHub account (not jon-or-ai), comment "@jon-or-ai please fix the typo in line 42 of foo.cs" on a PR in an allowlisted repo where a worktree exists.
@@ -415,7 +413,7 @@ If any of those six steps fails, the log line for that step tells you which serv
 ## Verification checklist before writing any code
 
 - [ ] Confirm the recipe-validated Claude Code version (2.1.138) is still current; flag if a newer release changed `~/.claude/sessions/<PID>.json` shape.
-- [ ] Set up the AI's `gh` config dir: `$env:GH_CONFIG_DIR = "C:\Users\Jon\.config\gh-ai"; gh auth login` and authenticate as `jon-or-ai`. Verify with `$env:GH_CONFIG_DIR = "..."; gh api notifications` returning the AI's inbox.
+- [ ] Confirm global `gh auth status` reports the account `AiUserLogin` is set to. Verify with `gh api notifications` returning that inbox.
 - [ ] Confirm `claude -p --bare --model haiku` works on the daemon's user account. **`--bare` is not in recipe.md's flag table** — verify it actually exists in the installed version, otherwise fall back to plain `-p` and accept the slower startup.
 - [ ] **Verify `--json-schema` flag exists** in the installed version (not in recipe.md's flag table). If missing, the L3 fallback is to validate the JSON shape against the embedded schema with `JsonSchema.Net` after the fact.
 - [ ] **Verify `structured_output` JSON path:** run a one-off `claude -p --output-format json --json-schema '<schema>' "test"` and inspect where the schema-validated payload lands in the response wrapper. Could be `result`, `result.structured_output`, top-level `structured_output`, or a string of JSON to re-parse. Get this wrong and L3 silently fails.

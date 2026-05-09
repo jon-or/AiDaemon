@@ -67,8 +67,8 @@ public class Worker : BackgroundService
         var interval = TimeSpan.FromSeconds(Math.Max(1, opts.PollIntervalSeconds));
 
         _logger.LogInformation(
-            "AiDaemon worker starting. PollInterval={IntervalSeconds}s DataDir={DataDir} GhConfigDir={GhConfigDir}",
-            interval.TotalSeconds, opts.DataDir, opts.GhConfigDir);
+            "AiDaemon worker starting. PollInterval={IntervalSeconds}s DataDir={DataDir} AiUserLogin={AiUserLogin}",
+            interval.TotalSeconds, opts.DataDir, opts.AiUserLogin);
 
         while (!stoppingToken.IsCancellationRequested)
         {
