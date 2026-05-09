@@ -317,12 +317,17 @@ public class DispatcherTests : IDisposable
 
     [Theory]
     // Real path observed in ~/.claude/projects/ on this machine — note dots in
-    // 'orez.worktrees' are replaced with '-', not preserved.
+    // 'orez.worktrees' are replaced with '-', and case of the source path is preserved
+    // (claude does not lowercase, so neither do we).
     [InlineData(@"D:\git\orez.worktrees\16119-isdpvirtualproperty",
+                "D--git-orez-worktrees-16119-isdpvirtualproperty")]
+    // Same path launched as lowercase 'd:' from Git Bash creates a separate (lowercase)
+    // project dir under ~/.claude/projects/.
+    [InlineData(@"d:\git\orez.worktrees\16119-isdpvirtualproperty",
                 "d--git-orez-worktrees-16119-isdpvirtualproperty")]
     // Recipe.md's example.
     [InlineData(@"C:\Users\Jon\AppData\Local\Temp\rc-resume-test",
-                "c--users-jon-appdata-local-temp-rc-resume-test")]
+                "C--Users-Jon-AppData-Local-Temp-rc-resume-test")]
     // Forward slashes (e.g. msys-style paths).
     [InlineData("/home/jon/code/foo.bar",
                 "-home-jon-code-foo-bar")]

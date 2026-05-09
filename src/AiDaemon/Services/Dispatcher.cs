@@ -271,10 +271,13 @@ public class Dispatcher : IDispatcher
     /// <summary>
     /// Converts a worktree path to the encoded directory name claude uses under
     /// <c>~/.claude/projects/</c>. The encoding replaces every non-alphanumeric character
-    /// (and non-hyphen) with <c>-</c>, then lowercases the result. Recipe.md mentioned only
-    /// path separators + drive colon, but empirically dots in directory names (e.g.
-    /// <c>orez.worktrees</c>) and other punctuation are also replaced — get this wrong and
-    /// the idle-timeout sweep can never find the JSONL.
+    /// (and non-hyphen) with <c>-</c> and preserves case. Recipe.md mentioned only path
+    /// separators + drive colon, but empirically dots in directory names (e.g.
+    /// <c>orez.worktrees</c>) and other punctuation are also replaced — and case is
+    /// preserved as the cwd was when claude was launched, so a worktree of <c>D:\...</c>
+    /// produces <c>D--...</c> and <c>d:\...</c> produces <c>d--...</c>. NTFS hides the
+    /// difference on <c>File.Exists</c>, but the idle-timeout sweep relies on string
+    /// equality of the path it computes here matching what claude wrote on disk.
     /// </summary>
     internal static string EncodeWorktreeAsProjectDir(string worktreePath)
     {
@@ -282,7 +285,7 @@ public class Dispatcher : IDispatcher
         foreach (var ch in worktreePath)
         {
             if (ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-')
-                sb.Append(char.ToLowerInvariant(ch));
+                sb.Append(ch);
             else
                 sb.Append('-');
         }
