@@ -10,6 +10,7 @@ namespace AiDaemon.Services;
 public class Dispatcher : IDispatcher
 {
     readonly IRcLauncher _launcher;
+    readonly IAgentPreRunner _preRunner;
     readonly INotificationPusher _pusher;
     readonly IStateStore _store;
     readonly IFileSystem _fs;
@@ -18,6 +19,7 @@ public class Dispatcher : IDispatcher
 
     public Dispatcher(
         IRcLauncher launcher,
+        IAgentPreRunner preRunner,
         INotificationPusher pusher,
         IStateStore store,
         IFileSystem fs,
@@ -25,6 +27,7 @@ public class Dispatcher : IDispatcher
         ILogger<Dispatcher> logger)
     {
         _launcher = launcher;
+        _preRunner = preRunner;
         _pusher = pusher;
         _store = store;
         _fs = fs;
@@ -85,14 +88,37 @@ public class Dispatcher : IDispatcher
             ResetRcFields(rec);
         }
 
-        // Case 3: spawn from Idle.
-        //   * If triage just produced a session (verdict.SessionId set), resume THAT — the
-        //     user's RC session inherits the agent's research/fix transcript.
-        //   * Otherwise, fall back to the previously stored sessionId (cross-tick resume).
-        //   * Otherwise, fresh spawn (claude assigns a UUID; we capture it from the registry).
-        var seedSid = !string.IsNullOrEmpty(verdict.SessionId)
-            ? verdict.SessionId
-            : (string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId);
+        // Case 3: spawn from Idle. Three options for the session id we hand RC:
+        //   * Cross-tick resume — if we already have a session for this branch from a prior
+        //     dispatch, reuse it so the conversation history is preserved.
+        //   * Fresh pre-run — generate a new session id, run the headless pre-run agent in the
+        //     worktree to do the research/fix work, then RC resumes that session.
+        var seedSid = string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId;
+
+        if (seedSid == null)
+        {
+            // No prior session for this branch — generate a sid and run the pre-run agent
+            // against it before opening RC. The pre-run is what actually does the work; RC
+            // is just the user's window into the resulting transcript.
+            seedSid = Guid.NewGuid().ToString();
+
+            try
+            {
+                await _preRunner.RunAsync(seedSid, branch, notification, verdict, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "pre-run threw — proceeding to RC anyway sid={Sid} branch={Branch}",
+                    seedSid, key);
+            }
+        }
+        else
+        {
+            _logger.LogInformation(
+                "dispatch: reusing prior session sid={Sid} branch={Branch} — skipping pre-run",
+                seedSid, key);
+        }
 
         RcAttachment attachment;
         try
@@ -103,6 +129,7 @@ public class Dispatcher : IDispatcher
         {
             _logger.LogError(ex, "spawn failed branch={Branch} sid={Sid} — aborting dispatch", key, seedSid ?? "(fresh)");
             // Persist whatever state we have so the next attempt resumes correctly.
+            rec.SessionId = seedSid ?? rec.SessionId;
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
             return DispatchOutcome.Failed;
         }

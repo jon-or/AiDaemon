@@ -112,10 +112,12 @@ public class TriagePipeline : ITriagePipeline
 
     public async Task<TriageVerdict> AgentTriageAsync(GhNotification n, BranchInfo branch, CancellationToken cancellationToken)
     {
-        var sid = Guid.NewGuid().ToString();
+        // Triage runs in a stable scratch cwd (NOT the worktree) so claude doesn't pay the
+        // CLAUDE.md auto-discovery + plugin sync cost on every notification. Reusing the same
+        // scratch dir across calls also keeps the prompt cache warm.
+        var scratchDir = Path.Combine(_options.DataDir, "triage-scratch");
 
-        // Fetch the comment body once: the agent gets it inline (saves a tool round-trip) and
-        // the asymmetric-bias check needs it after the agent returns.
+        // Fetch the comment body inline so the classifier doesn't need a tool round-trip.
         CommentInfo? comment = null;
         if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
         {
@@ -125,7 +127,7 @@ public class TriagePipeline : ITriagePipeline
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "agent triage: failed to pre-fetch comment body — agent can fetch via tools");
+                _logger.LogDebug(ex, "agent triage: failed to pre-fetch comment body");
             }
         }
         var commentBody = comment?.Body ?? "";
@@ -140,11 +142,11 @@ public class TriagePipeline : ITriagePipeline
                 userInput: userInput,
                 schemaJson: _schema.Value,
                 model: _options.Triage.Model,
-                workingDirectory: branch.Worktree,
+                workingDirectory: scratchDir,
                 timeout: L3Timeout,
                 cancellationToken: cancellationToken,
-                sessionId: sid,
-                permissionMode: "bypassPermissions");
+                sessionId: null,         // throwaway — no need to persist a classifier turn
+                permissionMode: null);   // classifier doesn't use tools
         }
         catch (Exception ex)
         {
@@ -154,8 +156,7 @@ public class TriagePipeline : ITriagePipeline
             return TriageVerdict.Actionable(
                 $"agent error ({ex.GetType().Name}) — actionable by default",
                 summary: TruncateSummary(n.Subject.Title),
-                confidence: 0.5,
-                sessionId: sid);
+                confidence: 0.5);
         }
 
         if (result.IsError)
@@ -166,8 +167,7 @@ public class TriagePipeline : ITriagePipeline
             return TriageVerdict.Actionable(
                 "agent reported is_error=true — actionable by default",
                 summary: TruncateSummary(n.Subject.Title),
-                confidence: 0.5,
-                sessionId: sid);
+                confidence: 0.5);
         }
 
         TriageStructuredOutput? llm = null;
@@ -190,8 +190,7 @@ public class TriagePipeline : ITriagePipeline
             return TriageVerdict.Actionable(
                 "agent returned no structured output — actionable by default",
                 summary: TruncateSummary(n.Subject.Title),
-                confidence: 0.5,
-                sessionId: sid);
+                confidence: 0.5);
         }
 
         // Trust the agent's verdict directly — no post-hoc bias rule.
@@ -199,11 +198,11 @@ public class TriagePipeline : ITriagePipeline
             ? TriageAction.Drop
             : TriageAction.Actionable;
 
-        var verdict = new TriageVerdict(action, llm.Why, llm.Summary, llm.Confidence, SessionId: sid);
+        var verdict = new TriageVerdict(action, llm.Why, llm.Summary, llm.Confidence);
 
         _logger.LogInformation(
-            "L3 verdict thread={ThreadId} branch={Branch} sid={Sid} action={Action} confidence={Confidence:F2} why={Why}",
-            n.Id, branch.Key, sid, verdict.Action, verdict.Confidence, verdict.Why);
+            "L3 verdict thread={ThreadId} branch={Branch} action={Action} confidence={Confidence:F2} why={Why}",
+            n.Id, branch.Key, verdict.Action, verdict.Confidence, verdict.Why);
 
         return verdict;
     }

@@ -212,23 +212,25 @@ public class TriagePipelineTests : IDisposable
     // ==================== AgentTriage (L3) ====================
 
     [Fact]
-    public async Task Agent_RunsClaudeInWorktreeWithSessionIdAndBypassPermissions()
+    public async Task Agent_RunsClaudeInScratchDir_NoSessionId_NoTools()
     {
         StubAgent("actionable", 0.95);
 
         var v = await _pipeline.AgentTriageAsync(N(), Branch(), default);
 
         Assert.Equal(TriageAction.Actionable, v.Action);
-        Assert.False(string.IsNullOrEmpty(v.SessionId));
 
+        // Triage runs in <DataDir>/triage-scratch (NOT the worktree), with no session-id
+        // (--no-session-persistence) and no permission-mode (no tools — pure classifier).
+        var expectedScratch = Path.Combine(_options.DataDir, "triage-scratch");
         _claude.Verify(c => c.RunHeadlessJsonAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<string>(),
-                @"D:\git\orez.worktrees\16119-isdpvirtualproperty",  // worktree as cwd
+                expectedScratch,
                 It.IsAny<TimeSpan>(),
                 It.IsAny<CancellationToken>(),
-                It.Is<string?>(s => !string.IsNullOrEmpty(s)),  // session-id set
-                "bypassPermissions"),
+                null,   // sessionId
+                null),  // permissionMode
             Times.Once);
     }
 
@@ -279,7 +281,6 @@ public class TriagePipelineTests : IDisposable
 
         Assert.Equal(TriageAction.Actionable, v.Action);
         Assert.Contains("agent error", v.Why);
-        Assert.False(string.IsNullOrEmpty(v.SessionId));
     }
 
     [Fact]

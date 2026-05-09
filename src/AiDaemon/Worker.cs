@@ -245,8 +245,8 @@ public class Worker : BackgroundService
             {
                 actionable++;
                 _logger.LogInformation(
-                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2} sid={Sid}",
-                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence, verdict.SessionId ?? "(none)");
+                    "verdict thread={ThreadId} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
+                    n.Id, verdict.Summary, verdict.Why, verdict.Confidence);
 
                 DispatchOutcome dispatchOutcome;
                 try

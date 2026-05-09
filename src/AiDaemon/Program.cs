@@ -65,6 +65,7 @@ builder.Services.AddSingleton<ITriagePipeline, TriagePipeline>();
 builder.Services.AddSingleton<IBranchResolver, BranchResolver>();
 builder.Services.AddSingleton<INotificationPoller, NotificationPoller>();
 builder.Services.AddSingleton<IRcLauncher, RcLauncher>();
+builder.Services.AddSingleton<IAgentPreRunner, AgentPreRunner>();
 builder.Services.AddSingleton<INotificationPusher, NoopNotificationPusher>();
 builder.Services.AddSingleton<IDispatcher, Dispatcher>();
 

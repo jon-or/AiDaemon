@@ -22,7 +22,12 @@ public class DaemonOptions
 
 public class TriageOptions
 {
+    /// <summary>Model used by the L3 classifier in scratch dir (just decides actionable/drop).</summary>
     public string Model { get; set; } = "haiku";
+
+    /// <summary>Model used by the headless pre-run agent in the worktree (does the actual research/fix).</summary>
+    public string PreRunModel { get; set; } = "opus";
+
     public bool BareMode { get; set; } = true;
     public int MaxActionsPerThreadPerDay { get; set; } = 5;
     public List<string> L2DropPatterns { get; set; } = new();

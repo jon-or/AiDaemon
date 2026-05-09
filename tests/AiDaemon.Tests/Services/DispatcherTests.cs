@@ -23,8 +23,11 @@ public class DispatcherTests : IDisposable
         RcIdleTimeoutHours = 2,
     };
 
+    readonly Mock<IAgentPreRunner> _preRunner = new();
+
     Dispatcher Build() => new(
         _launcher.Object,
+        _preRunner.Object,
         _pusher.Object,
         _store,
         _fs.Object,
@@ -37,6 +40,15 @@ public class DispatcherTests : IDisposable
         var connStr = $"Data Source={_dbPath};Mode=ReadWriteCreate;Cache=Shared";
         _store = new SqliteStateStore(connStr, NullLogger<SqliteStateStore>.Instance);
         _store.InitializeAsync(default).GetAwaiter().GetResult();
+
+        // Default: pre-run succeeds (returns true). Individual tests can override.
+        _preRunner.Setup(p => p.RunAsync(
+                It.IsAny<string>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<GhNotification>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
     }
 
     public void Dispose()
@@ -66,21 +78,29 @@ public class DispatcherTests : IDisposable
         => new(psPid, claudePid, startTicks, bridge, url, sessionId);
 
     [Fact]
-    public async Task FirstEvent_NoSessionId_SpawnsFreshAndPushesSessionLink()
+    public async Task FirstEvent_NoSessionId_RunsPreRunThenSpawnsRcWithSameSid()
     {
         var branch = Branch();
+        string? capturedPreRunSid = null;
+        string? capturedSpawnSid = null;
 
-        // First spawn passes sessionId=null; the launcher captures the fresh UUID from the
-        // registry and returns it on the attachment.
-        _launcher.Setup(l => l.SpawnRcAsync(branch, null, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(Att(sessionId: "fresh-uuid-from-registry"));
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch, It.IsAny<GhNotification>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string sid, BranchInfo _, GhNotification _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
+            .ReturnsAsync(true);
+
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
 
         var outcome = await Build().DispatchAsync(branch, N(), V(), default);
 
         Assert.Equal(DispatchOutcome.Spawned, outcome);
-        _launcher.Verify(l => l.SpawnRcAsync(branch, null, It.IsAny<CancellationToken>()), Times.Once);
+        Assert.NotNull(capturedPreRunSid);
+        Assert.Equal(capturedPreRunSid, capturedSpawnSid);  // same sid threaded through both steps
+
         _pusher.Verify(p => p.PushSessionLinkAsync(
-            "https://claude.ai/code/session_01ABC", branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+            It.IsAny<string>(), branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Once);
         _pusher.Verify(p => p.PushHeadsUpAsync(
             It.IsAny<string>(), It.IsAny<BranchInfo>(), It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
@@ -89,12 +109,9 @@ public class DispatcherTests : IDisposable
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
         Assert.NotNull(rec);
         Assert.Equal(BranchMode.RcActive, rec!.Mode);
-        Assert.Equal("fresh-uuid-from-registry", rec.SessionId);
+        Assert.Equal(capturedPreRunSid, rec.SessionId);
         Assert.Equal(1234, rec.RcPid);
         Assert.Equal(5678, rec.RcClaudePid);
-        Assert.Equal(1_000_000_000_000L, rec.RcClaudeStart);
-        Assert.Equal("session_01ABC", rec.RcBridgeId);
-        Assert.Equal("https://claude.ai/code/session_01ABC", rec.RcUrl);
         Assert.Equal(16119, rec.IssueNumber);
     }
 
@@ -178,10 +195,11 @@ public class DispatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task SpawnFailure_ReturnsFailed_NoPush()
+    public async Task SpawnFailure_ReturnsFailed_NoPush_PreservesPreRunSessionId()
     {
         var branch = Branch();
-        _launcher.Setup(l => l.SpawnRcAsync(branch, null, It.IsAny<CancellationToken>()))
+        // Spawn fails for any sid the dispatcher generates.
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new TimeoutException("PowerShell never spawned claude.exe"));
 
         var outcome = await Build().DispatchAsync(branch, N(), V(), default);
@@ -191,12 +209,12 @@ public class DispatcherTests : IDisposable
             It.IsAny<string>(), It.IsAny<BranchInfo>(), It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Never);
 
-        // The branch row exists in Idle so cross-tick state is consistent — the next event will
-        // try a fresh spawn again.
+        // The branch row exists in Idle and persists the sid we ran pre-run against, so the
+        // next dispatch can reuse it without re-running pre-run.
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
         Assert.NotNull(rec);
         Assert.Equal(BranchMode.Idle, rec!.Mode);
-        Assert.True(string.IsNullOrEmpty(rec.SessionId), "no sessionId yet on first-time spawn failure");
+        Assert.False(string.IsNullOrEmpty(rec.SessionId), "sid generated for pre-run is preserved");
     }
 
     [Fact]

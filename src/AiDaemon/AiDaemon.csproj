@@ -31,6 +31,7 @@
   <ItemGroup>
     <EmbeddedResource Include="Storage\Schema.sql" />
     <EmbeddedResource Include="Triage\system-prompt.md" />
+    <EmbeddedResource Include="Triage\pre-run-prompt.md" />
     <EmbeddedResource Include="Triage\schema.json" />
   </ItemGroup>
 
