@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Management;
 using System.Text.Json;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Io;
 using AiDaemon.Models;
@@ -77,13 +78,13 @@ public class RcLauncher : IRcLauncher
         if (!startResult.Succeeded)
         {
             throw new InvalidOperationException(
-                $"Start-Process failed (exit {startResult.ExitCode}): {Truncate(startResult.Stderr, 500)}");
+                $"Start-Process failed (exit {startResult.ExitCode}): {startResult.Stderr.TruncateWithEllipsis(500)}");
         }
 
         if (!int.TryParse(startResult.Stdout.Trim(), out var psPid) || psPid <= 0)
         {
             throw new InvalidOperationException(
-                $"Start-Process did not return a parseable PID. stdout='{Truncate(startResult.Stdout, 200)}' stderr='{Truncate(startResult.Stderr, 200)}'");
+                $"Start-Process did not return a parseable PID. stdout='{startResult.Stdout.TruncateWithEllipsis(200)}' stderr='{startResult.Stderr.TruncateWithEllipsis(200)}'");
         }
 
         _logger.LogDebug("inner PowerShell PID={PsPid}", psPid);
@@ -133,7 +134,7 @@ public class RcLauncher : IRcLauncher
         return Task.CompletedTask;
     }
 
-    public bool IsAlive(int claudePid, long claudeStartTicks)
+    public async Task<bool> IsAliveAsync(int claudePid, long claudeStartTicks, CancellationToken cancellationToken)
     {
         try
         {
@@ -163,37 +164,54 @@ public class RcLauncher : IRcLauncher
         // Bridge-alive check: the registry must still show a non-null bridgeSessionId. If the
         // relay tore down (e.g. the 10-min outage scenario from recipe.md) the local process can
         // remain alive but we should treat the session as dead and respawn.
-        var path = RegistryPath(claudePid);
-        if (!_fs.FileExists(path))
-            return false;
-
+        //
         // claude.exe rewrites the registry file in place when bridge state changes. A read
         // landing mid-write produces an IOException or JsonException — without a retry, the
         // dispatcher would reap a healthy RC because we caught the file in flux. One retry
         // after 100ms is enough to clear that window in practice.
-        if (TryReadBridgeId(path, claudePid))
+        var path = RegistryPath(claudePid);
+        if (!_fs.FileExists(path))
+            return false;
+
+        if (TryReadRegistry(path, claudePid, "IsAlive").Ok)
             return true;
 
-        Thread.Sleep(100);
-        return TryReadBridgeId(path, claudePid);
+        await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+        return TryReadRegistry(path, claudePid, "IsAlive").Ok;
     }
 
-    bool TryReadBridgeId(string path, int claudePid)
+    /// <summary>
+    /// Reads the per-PID claude registry JSON and extracts <c>bridgeSessionId</c> +
+    /// <c>sessionId</c>. <see cref="RegistryRead.Ok"/> is true only when bridgeSessionId is
+    /// a non-empty string. Transient IO/Json failures are swallowed (the file is rewritten in
+    /// place by claude.exe and reads can land mid-write); callers retry as appropriate.
+    /// </summary>
+    RegistryRead TryReadRegistry(string path, int claudePid, string context)
     {
         try
         {
             var json = _fs.ReadAllText(path);
             using var doc = JsonDocument.Parse(json);
-            return doc.RootElement.TryGetProperty("bridgeSessionId", out var b)
-                && b.ValueKind == JsonValueKind.String
-                && !string.IsNullOrEmpty(b.GetString());
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("bridgeSessionId", out var b)
+                || b.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(b.GetString()))
+            {
+                return default;
+            }
+
+            var sid = root.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
+            return new RegistryRead(true, b.GetString()!, sid);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
-            _logger.LogDebug(ex, "IsAlive: registry read transient failure for PID {Pid}", claudePid);
-            return false;
+            _logger.LogDebug(ex, "{Context}: registry read transient failure for PID {Pid}", context, claudePid);
+            return default;
         }
     }
+
+    readonly record struct RegistryRead(bool Ok, string BridgeSessionId, string SessionId);
 
     // ---------------- helpers ----------------
 
@@ -283,25 +301,12 @@ public class RcLauncher : IRcLauncher
 
             if (_fs.FileExists(path))
             {
-                try
+                var read = TryReadRegistry(path, claudePid, "PollRegistry");
+                if (read.Ok)
                 {
-                    var json = _fs.ReadAllText(path);
-                    using var doc = JsonDocument.Parse(json);
-                    var root = doc.RootElement;
-
-                    if (root.TryGetProperty("bridgeSessionId", out var b)
-                        && b.ValueKind == JsonValueKind.String
-                        && !string.IsNullOrEmpty(b.GetString()))
-                    {
-                        var bsid = b.GetString()!;
-                        var sid = root.TryGetProperty("sessionId", out var s) ? s.GetString() ?? "" : "";
-                        _logger.LogDebug("registry populated for PID {Pid}: bridge={Bridge} sid={Sid}", claudePid, bsid, sid);
-                        return (bsid, sid);
-                    }
-                }
-                catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
-                {
-                    _logger.LogDebug(ex, "registry read transient failure for PID {Pid} — retrying", claudePid);
+                    _logger.LogDebug("registry populated for PID {Pid}: bridge={Bridge} sid={Sid}",
+                        claudePid, read.BridgeSessionId, read.SessionId);
+                    return (read.BridgeSessionId, read.SessionId);
                 }
             }
 
@@ -364,5 +369,4 @@ public class RcLauncher : IRcLauncher
         return string.IsNullOrEmpty(s) ? "ai-daemon" : s;
     }
 
-    static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 }

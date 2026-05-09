@@ -1,5 +1,5 @@
-using System.Reflection;
 using System.Text;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using Microsoft.Extensions.Logging;
@@ -16,7 +16,8 @@ public class AgentPreRunner : IAgentPreRunner
     readonly DaemonOptions _options;
     readonly ILogger<AgentPreRunner> _logger;
 
-    readonly Lazy<string> _systemPrompt = new(() => LoadEmbedded("pre-run-prompt.md"));
+    readonly Lazy<string> _systemPrompt = new(() =>
+        EmbeddedResource.Load(typeof(AgentPreRunner).Assembly, "pre-run-prompt.md"));
 
     public AgentPreRunner(
         IClaudeRunner claude,
@@ -129,16 +130,4 @@ public class AgentPreRunner : IAgentPreRunner
         return sb.ToString();
     }
 
-    static string LoadEmbedded(string fileName)
-    {
-        var asm = typeof(AgentPreRunner).Assembly;
-        var name = asm.GetManifestResourceNames()
-            .FirstOrDefault(n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
-                $"Embedded resource {fileName} not found. Check AiDaemon.csproj <EmbeddedResource> entries.");
-
-        using var stream = asm.GetManifestResourceStream(name)!;
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 }

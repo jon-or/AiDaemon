@@ -1,7 +1,7 @@
-using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using AiDaemon.Storage;
@@ -33,8 +33,9 @@ public class TriagePipeline : ITriagePipeline
     readonly DaemonOptions _options;
     readonly ILogger<TriagePipeline> _logger;
 
-    readonly Lazy<string> _systemPrompt = new(() => LoadEmbedded("system-prompt.md"));
-    readonly Lazy<string> _schema = new(() => LoadEmbedded("schema.json"));
+    static readonly System.Reflection.Assembly OwnAssembly = typeof(TriagePipeline).Assembly;
+    readonly Lazy<string> _systemPrompt = new(() => EmbeddedResource.Load(OwnAssembly, "system-prompt.md"));
+    readonly Lazy<string> _schema = new(() => EmbeddedResource.Load(OwnAssembly, "schema.json"));
     readonly Lazy<List<Regex>> _l2Patterns;
     readonly HashSet<string> _actionableReasons;
     readonly HashSet<string> _botBlocklist;
@@ -145,10 +146,7 @@ public class TriagePipeline : ITriagePipeline
             _logger.LogWarning(ex,
                 "agent triage failed branch={Branch} count={Count} — defaulting to actionable",
                 branch.Key, items.Count);
-            return TriageVerdict.Actionable(
-                $"agent error ({ex.GetType().Name}) — actionable by default",
-                summary: TruncateSummary(primary.Notification.Subject.Title),
-                confidence: 0.5);
+            return DefaultActionable(primary, $"agent error ({ex.GetType().Name}) — actionable by default");
         }
 
         if (result.IsError)
@@ -156,10 +154,7 @@ public class TriagePipeline : ITriagePipeline
             _logger.LogWarning(
                 "agent triage is_error=true branch={Branch} count={Count} result={Result} — defaulting to actionable",
                 branch.Key, items.Count, result.Result);
-            return TriageVerdict.Actionable(
-                "agent reported is_error=true — actionable by default",
-                summary: TruncateSummary(primary.Notification.Subject.Title),
-                confidence: 0.5);
+            return DefaultActionable(primary, "agent reported is_error=true — actionable by default");
         }
 
         TriageStructuredOutput? llm = null;
@@ -179,10 +174,7 @@ public class TriagePipeline : ITriagePipeline
         {
             _logger.LogWarning(
                 "agent triage returned no structured output branch={Branch} — defaulting to actionable", branch.Key);
-            return TriageVerdict.Actionable(
-                "agent returned no structured output — actionable by default",
-                summary: TruncateSummary(primary.Notification.Subject.Title),
-                confidence: 0.5);
+            return DefaultActionable(primary, "agent returned no structured output — actionable by default");
         }
 
         // Trust the agent's verdict directly — no post-hoc bias rule.
@@ -248,6 +240,12 @@ public class TriagePipeline : ITriagePipeline
     static string TruncateSummary(string s)
         => string.IsNullOrEmpty(s) ? "(no summary)" : (s.Length <= 200 ? s : s[..200]);
 
+    static TriageVerdict DefaultActionable(NotificationWithBody primary, string why)
+        => TriageVerdict.Actionable(
+            why,
+            summary: TruncateSummary(primary.Notification.Subject.Title),
+            confidence: 0.5);
+
     /// <summary>
     /// Strips GitHub quoted-reply lines (lines starting with <c>&gt;</c>) and the immediately
     /// following blank separator line, so L2 patterns don't match against quoted noise.
@@ -279,16 +277,4 @@ public class TriagePipeline : ITriagePipeline
         return sb.ToString().Trim();
     }
 
-    static string LoadEmbedded(string fileName)
-    {
-        var asm = typeof(TriagePipeline).Assembly;
-        var name = asm.GetManifestResourceNames()
-            .FirstOrDefault(n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
-                $"Embedded resource {fileName} not found. Check AiDaemon.csproj <EmbeddedResource> entries.");
-
-        using var stream = asm.GetManifestResourceStream(name)!;
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 }

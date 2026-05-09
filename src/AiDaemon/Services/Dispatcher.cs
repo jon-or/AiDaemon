@@ -67,7 +67,7 @@ public class Dispatcher : IDispatcher
         if (rec.Mode == BranchMode.RcActive
             && rec.RcClaudePid is int claudePid
             && rec.RcClaudeStart is long claudeStart
-            && _launcher.IsAlive(claudePid, claudeStart))
+            && await _launcher.IsAliveAsync(claudePid, claudeStart, cancellationToken))
         {
             rec.LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
@@ -188,7 +188,7 @@ public class Dispatcher : IDispatcher
             // Case 1: dead process or torn-down bridge.
             if (rec.RcClaudePid is not int pid
                 || rec.RcClaudeStart is not long start
-                || !_launcher.IsAlive(pid, start))
+                || !await _launcher.IsAliveAsync(pid, start, cancellationToken))
             {
                 _logger.LogInformation("sweep: reaping dead/stale RC branch={Branch} pid={Pid}", rec.Branch, rec.RcClaudePid);
                 await ReapAsync(rec, "dead", cancellationToken);

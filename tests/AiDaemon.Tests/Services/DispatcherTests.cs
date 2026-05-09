@@ -137,7 +137,7 @@ public class DispatcherTests : IDisposable
             IssueNumber = 16119,
         }, default);
 
-        _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(true);
+        _launcher.Setup(l => l.IsAliveAsync(5678, 1_000_000_000_000L, It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
         var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
 
@@ -174,7 +174,7 @@ public class DispatcherTests : IDisposable
             IssueNumber = 16119,
         }, default);
 
-        _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(false);
+        _launcher.Setup(l => l.IsAliveAsync(5678, 1_000_000_000_000L, It.IsAny<CancellationToken>())).ReturnsAsync(false);
         _launcher.Setup(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         _launcher.Setup(l => l.SpawnRcAsync(branch, sid, It.IsAny<CancellationToken>()))
             .ReturnsAsync(Att(psPid: 9999, claudePid: 8888, startTicks: 2_000_000_000_000L,
@@ -328,7 +328,7 @@ public class DispatcherTests : IDisposable
             LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         }, default);
 
-        _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(false);
+        _launcher.Setup(l => l.IsAliveAsync(5678, 1_000_000_000_000L, It.IsAny<CancellationToken>())).ReturnsAsync(false);
         _launcher.Setup(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
 
         await Build().SweepAsync(default);
@@ -361,7 +361,7 @@ public class DispatcherTests : IDisposable
             LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         }, default);
 
-        _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(true);
+        _launcher.Setup(l => l.IsAliveAsync(5678, 1_000_000_000_000L, It.IsAny<CancellationToken>())).ReturnsAsync(true);
 
         // Capture the path the dispatcher actually queries against — assert it equals the
         // exact JSONL location claude writes (encoded worktree + sessionId.jsonl). A
@@ -414,7 +414,7 @@ public class DispatcherTests : IDisposable
             LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         }, default);
 
-        _launcher.Setup(l => l.IsAlive(5678, 1_000_000_000_000L)).Returns(true);
+        _launcher.Setup(l => l.IsAliveAsync(5678, 1_000_000_000_000L, It.IsAny<CancellationToken>())).ReturnsAsync(true);
         _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
         _fs.Setup(f => f.GetLastWriteTimeUtc(It.IsAny<string>())).Returns(DateTime.UtcNow.AddMinutes(-30));
 

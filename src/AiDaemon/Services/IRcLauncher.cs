@@ -25,6 +25,8 @@ public interface IRcLauncher
     /// True iff (a) the claude PID is still running with the same StartTime ticks (PID-recycle
     /// guard) AND (b) the per-PID registry file still carries a non-null bridgeSessionId.
     /// Anything short of both is "not alive" — the caller should clean up and respawn.
+    /// Async because the bridge-id check retries once after 100ms to ride out a registry
+    /// rewrite landing mid-read.
     /// </summary>
-    bool IsAlive(int claudePid, long claudeStartTicks);
+    Task<bool> IsAliveAsync(int claudePid, long claudeStartTicks, CancellationToken cancellationToken);
 }

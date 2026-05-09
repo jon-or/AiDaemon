@@ -1,4 +1,4 @@
-using System.Reflection;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using Dapper;
@@ -38,7 +38,7 @@ public class SqliteStateStore : IStateStore
 
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
-        var schema = LoadEmbeddedSchema();
+        var schema = EmbeddedResource.Load(typeof(SqliteStateStore).Assembly, "Schema.sql");
 
         await using var conn = await OpenAsync(cancellationToken);
         await conn.ExecuteAsync(new CommandDefinition(schema, cancellationToken: cancellationToken));
@@ -49,12 +49,12 @@ public class SqliteStateStore : IStateStore
     public async Task<bool> IsProcessedAsync(string threadId, string commentId, CancellationToken cancellationToken)
     {
         await using var conn = await OpenAsync(cancellationToken);
-        var count = await conn.ExecuteScalarAsync<long>(new CommandDefinition(
-            "select count(*) from processed where thread_id = $tid and comment_id = $cid",
+        var hit = await conn.ExecuteScalarAsync<long?>(new CommandDefinition(
+            "select 1 from processed where thread_id = $tid and comment_id = $cid limit 1",
             new { tid = threadId, cid = commentId },
             cancellationToken: cancellationToken));
 
-        return count > 0;
+        return hit is not null;
     }
 
     public async Task MarkProcessedAsync(string threadId, string commentId, string outcome, CancellationToken cancellationToken)
@@ -216,21 +216,6 @@ public class SqliteStateStore : IStateStore
             cancellationToken: cancellationToken));
 
         return conn;
-    }
-
-    static string LoadEmbeddedSchema()
-    {
-        var asm = typeof(SqliteStateStore).Assembly;
-        var name = asm.GetManifestResourceNames()
-            .FirstOrDefault(n => n.EndsWith("Schema.sql", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
-                "Schema.sql not found as embedded resource. Check AiDaemon.csproj <EmbeddedResource Include=\"Storage\\Schema.sql\" />.");
-
-        using var stream = asm.GetManifestResourceStream(name)
-            ?? throw new InvalidOperationException($"Failed to open embedded resource {name}");
-        using var reader = new StreamReader(stream);
-
-        return reader.ReadToEnd();
     }
 
     /// <summary>Internal row shape — mirrors the table for Dapper hydration.</summary>

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Process;
 using Microsoft.Extensions.Logging;
@@ -85,7 +86,7 @@ public class ClaudeRunner : IClaudeRunner
         if (!result.Succeeded)
         {
             throw new InvalidOperationException(
-                $"claude -p failed (exit {result.ExitCode}): {Truncate(result.Stderr, 500)}");
+                $"claude -p failed (exit {result.ExitCode}): {result.Stderr.TruncateWithEllipsis(500)}");
         }
 
         // The wrapper is one JSON object on stdout. With --output-format=json there's no streaming.
@@ -97,7 +98,7 @@ public class ClaudeRunner : IClaudeRunner
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"claude -p stdout was not valid JSON: {ex.Message}. First 200 chars: {Truncate(result.Stdout, 200)}",
+                $"claude -p stdout was not valid JSON: {ex.Message}. First 200 chars: {result.Stdout.TruncateWithEllipsis(200)}",
                 ex);
         }
 
@@ -113,5 +114,4 @@ public class ClaudeRunner : IClaudeRunner
         }
     }
 
-    static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 }

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Models;
 using AiDaemon.Process;
@@ -120,12 +121,10 @@ public class GhClient : IGhClient
         catch (JsonException ex)
         {
             throw new InvalidOperationException(
-                $"Failed to parse gh stdout for {context}: {ex.Message}. First 200 chars: {Truncate(stdout, 200)}",
+                $"Failed to parse gh stdout for {context}: {ex.Message}. First 200 chars: {stdout.TruncateWithEllipsis(200)}",
                 ex);
         }
     }
-
-    static string Truncate(string s, int max) => s.Length <= max ? s : s[..max] + "…";
 
     /// <summary>
     /// `gh api` accepts either an absolute https://api.github.com URL or just the path part.
