@@ -1,5 +1,23 @@
 {
+  "_README": [
+    "Copy this file to appsettings.Local.json (gitignored) and fill in your values.",
+    "Anything here overrides appsettings.json. Only set keys you want to override.",
+    "",
+    "Required for the daemon to do useful work:",
+    "  Daemon.AiUserLogin   GitHub login the daemon polls as. Must match `gh auth status`.",
+    "                       Used by the L1 self-drop in triage so the daemon never echoes",
+    "                       its own comments.",
+    "  Daemon.WorktreeRoot  Absolute path to the directory holding per-issue worktrees,",
+    "                       named '<issue>-<slug>' (e.g. 16119-isdpvirtualproperty).",
+    "  Daemon.RepoAllowlist GitHub repos the daemon may act on (others are skipped).",
+    "  Daemon.Ntfy.Topic    Random UUID-like string. Anyone with the topic can read your",
+    "                       pushes — keep it private."
+  ],
+
   "Daemon": {
+    "AiUserLogin": "your-github-login",
+    "WorktreeRoot": "C:\\Users\\you\\worktrees",
+    "RepoAllowlist": [ "your-org/your-repo" ],
     "Ntfy": {
       "Topic": "REPLACE-WITH-A-RANDOM-UUID-LIKE-STRING"
     }
