@@ -73,6 +73,11 @@ public class AgentPreRunner : IAgentPreRunner
                 sessionId, branch.Key, result.DurationMs);
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            // Daemon is shutting down — let the dispatcher abort the whole flow.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,

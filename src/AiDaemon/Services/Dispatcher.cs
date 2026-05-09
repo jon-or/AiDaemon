@@ -252,21 +252,34 @@ public class Dispatcher : IDispatcher
         if (string.IsNullOrEmpty(rec.SessionId) || string.IsNullOrEmpty(rec.Worktree))
             return false;
 
-        // ~/.claude/projects/<encoded-cwd>/<sid>.jsonl, where <encoded-cwd> is the worktree path
-        // with each path separator (and the drive colon on Windows) replaced by '-'.
-        var encoded = rec.Worktree
-            .Replace('\\', '-')
-            .Replace('/', '-')
-            .Replace(":", "-");
-
         path = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".claude",
             "projects",
-            encoded,
+            EncodeWorktreeAsProjectDir(rec.Worktree),
             $"{rec.SessionId}.jsonl");
 
         return true;
     }
 
+    /// <summary>
+    /// Converts a worktree path to the encoded directory name claude uses under
+    /// <c>~/.claude/projects/</c>. The encoding replaces every non-alphanumeric character
+    /// (and non-hyphen) with <c>-</c>, then lowercases the result. Recipe.md mentioned only
+    /// path separators + drive colon, but empirically dots in directory names (e.g.
+    /// <c>orez.worktrees</c>) and other punctuation are also replaced — get this wrong and
+    /// the idle-timeout sweep can never find the JSONL.
+    /// </summary>
+    public static string EncodeWorktreeAsProjectDir(string worktreePath)
+    {
+        var sb = new System.Text.StringBuilder(worktreePath.Length);
+        foreach (var ch in worktreePath)
+        {
+            if (ch is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-')
+                sb.Append(char.ToLowerInvariant(ch));
+            else
+                sb.Append('-');
+        }
+        return sb.ToString();
+    }
 }

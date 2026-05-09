@@ -140,6 +140,11 @@ public class TriagePipeline : ITriagePipeline
                 sessionId: null,         // throwaway — no need to persist a classifier turn
                 permissionMode: null);   // classifier doesn't use tools
         }
+        catch (OperationCanceledException)
+        {
+            // Daemon shutdown — abort the tick rather than fabricating a fallback verdict.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,

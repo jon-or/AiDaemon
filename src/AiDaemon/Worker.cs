@@ -165,6 +165,7 @@ public class Worker : BackgroundService
             {
                 (quick, commentBody) = await _triage.QuickTriageAsync(n, cancellationToken);
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "quick triage threw thread={ThreadId} — skipping", n.Id);
@@ -186,6 +187,7 @@ public class Worker : BackgroundService
             {
                 branch = await _resolver.ResolveAsync(n, cancellationToken);
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "branch resolve threw thread={ThreadId}", n.Id);
@@ -233,6 +235,7 @@ public class Worker : BackgroundService
                 {
                     verdict = await _triage.AgentTriageAsync(batch.Items, batch.Branch, cancellationToken);
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
@@ -264,6 +267,7 @@ public class Worker : BackgroundService
             {
                 dispatchOutcome = await _dispatcher.DispatchAsync(batch.Branch, batch.Items, verdict, cancellationToken);
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "dispatch threw branch={Branch}", branchKey);

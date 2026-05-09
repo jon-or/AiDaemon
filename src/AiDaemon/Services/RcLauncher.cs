@@ -60,7 +60,7 @@ public class RcLauncher : IRcLauncher
         // window — Process.Start with UseShellExecute=false from a Git Bash / dotnet-run parent
         // would otherwise share the parent's console (and RC silently fails to register on a
         // shared TTY).
-        var outerScript = BuildStartProcessScript(branch.Worktree, innerCmd);
+        var outerScript = BuildStartProcessScript(_options.PowerShellPath, branch.Worktree, innerCmd);
 
         _logger.LogInformation(
             "spawning RC PowerShell sessionId={Sid} branch={Branch} worktree={Worktree} rcName={RcName}",
@@ -187,18 +187,21 @@ public class RcLauncher : IRcLauncher
     /// <summary>
     /// Outer-PowerShell script: launch a new visible console with <see cref="ProcessWindowStyle.Normal"/>,
     /// run the supplied <paramref name="innerCmd"/> via <c>-NoExit -Command</c>, return the
-    /// inner PowerShell PID on stdout. Single-quotes around interpolated paths/cmd are
-    /// PowerShell single-quoted-string literals; we double any embedded apostrophe to escape it.
+    /// inner PowerShell PID on stdout. Uses the same <paramref name="powerShellPath"/> as
+    /// the outer call so a custom config (e.g. pwsh.exe) is honored on both sides.
+    /// Single-quotes around interpolated paths/cmd are PowerShell single-quoted-string
+    /// literals; we double any embedded apostrophe to escape it.
     /// </summary>
-    static string BuildStartProcessScript(string worktree, string innerCmd)
+    public static string BuildStartProcessScript(string powerShellPath, string worktree, string innerCmd)
     {
         static string EscapeSingle(string s) => s.Replace("'", "''");
+        var ps = EscapeSingle(powerShellPath);
         var wd = EscapeSingle(worktree);
         var cmd = EscapeSingle(innerCmd);
 
         return
             $"$ErrorActionPreference='Stop'; " +
-            $"$p = Start-Process -FilePath 'powershell.exe' -PassThru " +
+            $"$p = Start-Process -FilePath '{ps}' -PassThru " +
             $"-WorkingDirectory '{wd}' " +
             $"-ArgumentList @('-NoExit','-NoProfile','-Command','{cmd}'); " +
             $"if ($p) {{ Write-Output $p.Id }} else {{ Write-Error 'Start-Process returned null' }}";

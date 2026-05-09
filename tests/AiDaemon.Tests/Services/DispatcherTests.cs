@@ -315,6 +315,22 @@ public class DispatcherTests : IDisposable
         Assert.Equal(BranchMode.RcActive, rec!.Mode);
     }
 
+    [Theory]
+    // Real path observed in ~/.claude/projects/ on this machine — note dots in
+    // 'orez.worktrees' are replaced with '-', not preserved.
+    [InlineData(@"D:\git\orez.worktrees\16119-isdpvirtualproperty",
+                "d--git-orez-worktrees-16119-isdpvirtualproperty")]
+    // Recipe.md's example.
+    [InlineData(@"C:\Users\Jon\AppData\Local\Temp\rc-resume-test",
+                "c--users-jon-appdata-local-temp-rc-resume-test")]
+    // Forward slashes (e.g. msys-style paths).
+    [InlineData("/home/jon/code/foo.bar",
+                "-home-jon-code-foo-bar")]
+    public void EncodeWorktreeAsProjectDir_MatchesClaudesEncoding(string worktree, string expected)
+    {
+        Assert.Equal(expected, Dispatcher.EncodeWorktreeAsProjectDir(worktree));
+    }
+
     [Fact]
     public async Task ReconcileOnStartup_ResetsAllRcActiveRowsToIdle_PreservesSessionIds()
     {
