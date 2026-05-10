@@ -18,13 +18,13 @@ public class RcLauncher : IRcLauncher
     static readonly TimeSpan ChildLookupTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// How long to poll the per-PID registry for <c>bridgeSessionId</c>. When the relay
-    /// is healthy, the bridge populates within ~1s; if it hasn't shown up after 5s the
-    /// remote-control server is almost certainly down (the documented failure mode is the
-    /// claude.ai relay being unreachable). 5s lets the dispatcher fail fast and emit an
-    /// "RC unavailable" push instead of blocking the tick for half a minute.
+    /// How long to poll the per-PID registry for <c>bridgeSessionId</c>. The relay usually
+    /// registers in 1-2s when healthy, but we've seen it take longer under load — at 5s the
+    /// dispatcher was firing spurious "Not Available" pushes for sessions that ended up
+    /// registering a few seconds later. 10s is enough headroom to ride those out without
+    /// blocking the tick for half a minute when the relay is genuinely down.
     /// </summary>
-    static readonly TimeSpan RegistryPollTimeout = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan RegistryPollTimeout = TimeSpan.FromSeconds(10);
 
     /// <summary>How long to wait for the outer Start-Process call to return the inner PS PID.</summary>
     static readonly TimeSpan StartProcessTimeout = TimeSpan.FromSeconds(10);
