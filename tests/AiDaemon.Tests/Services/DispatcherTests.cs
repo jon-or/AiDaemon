@@ -41,14 +41,16 @@ public class DispatcherTests : IDisposable
         _store = new SqliteStateStore(connStr, NullLogger<SqliteStateStore>.Instance);
         _store.InitializeAsync(default).GetAwaiter().GetResult();
 
-        // Default: pre-run succeeds (returns true). Individual tests can override.
+        // Default: pre-run succeeds with an empty summary so existing tests don't have to
+        // care about summary substitution. Tests that exercise the summary substitution
+        // override this with a non-empty Summary.
         _preRunner.Setup(p => p.RunAsync(
                 It.IsAny<string>(),
                 It.IsAny<BranchInfo>(),
                 It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(),
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
+            .ReturnsAsync(new PreRunResult(true, ""));
     }
 
     public void Dispose()
@@ -87,7 +89,7 @@ public class DispatcherTests : IDisposable
         _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch, It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
             .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
-            .ReturnsAsync(true);
+            .ReturnsAsync(new PreRunResult(true, ""));
 
         // The dispatcher checks for the post-pre-run JSONL to decide whether to resume or
         // fresh-spawn. Pre-run succeeded → JSONL exists.
@@ -103,11 +105,9 @@ public class DispatcherTests : IDisposable
         Assert.NotNull(capturedPreRunSid);
         Assert.Equal(capturedPreRunSid, capturedSpawnSid);  // same sid threaded through both steps
 
-        _pusher.Verify(p => p.PushSessionLinkAsync(
-            It.IsAny<string>(), branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+        _pusher.Verify(p => p.PushSessionLinkAsync(It.IsAny<string>(), branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Once);
-        _pusher.Verify(p => p.PushHeadsUpAsync(
-            It.IsAny<string>(), It.IsAny<BranchInfo>(), It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+        _pusher.Verify(p => p.PushHeadsUpAsync(It.IsAny<string>(), It.IsAny<BranchInfo>(), It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Never);
 
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
@@ -148,8 +148,7 @@ public class DispatcherTests : IDisposable
         Assert.Equal(DispatchOutcome.HeadsUp, outcome);
         _launcher.Verify(l => l.SpawnRcAsync(It.IsAny<BranchInfo>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
         _launcher.Verify(l => l.CleanupAsync(It.IsAny<BranchState>(), It.IsAny<CancellationToken>()), Times.Never);
-        _pusher.Verify(p => p.PushHeadsUpAsync(
-            "https://claude.ai/code/session_01ABC", branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+        _pusher.Verify(p => p.PushHeadsUpAsync("https://claude.ai/code/session_01ABC", branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Once);
 
         // last_event_at advanced.
@@ -234,7 +233,7 @@ public class DispatcherTests : IDisposable
         _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
                 It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false); // is_error=true equivalent — no JSONL produced
+            .ReturnsAsync(PreRunResult.Failed); // is_error=true equivalent — no JSONL produced
 
         _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(false);
 
@@ -264,7 +263,7 @@ public class DispatcherTests : IDisposable
                 It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
             .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
-            .ReturnsAsync(true);
+            .ReturnsAsync(new PreRunResult(true, ""));
 
         _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
 
@@ -276,6 +275,66 @@ public class DispatcherTests : IDisposable
 
         Assert.NotNull(capturedSpawnSid);
         Assert.Equal(capturedPreRunSid, capturedSpawnSid);
+    }
+
+    [Fact]
+    public async Task FirstEvent_PreRunSummary_SubstitutesIntoPushVerdict()
+    {
+        var branch = Branch();
+        const string preRunSummary = "Claude Bot requested several syntax changes including root namespaces. I've made the requested changes — ready for you to review.";
+
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PreRunResult(true, preRunSummary));
+
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
+
+        TriageVerdict? capturedVerdict = null;
+        _pusher.Setup(p => p.PushSessionLinkAsync(It.IsAny<string>(), branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string _, BranchInfo _, string _, TriageVerdict v, CancellationToken _) => capturedVerdict = v)
+            .Returns(Task.CompletedTask);
+
+        // Triage's verdict carries a terser one-liner ("fix the thing") — pre-run's richer
+        // summary should override it on the way to the phone.
+        var triageVerdict = TriageVerdict.Actionable("test", "fix the thing");
+        await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, triageVerdict, default);
+
+        Assert.NotNull(capturedVerdict);
+        Assert.Equal(preRunSummary, capturedVerdict!.Summary);
+        // Other fields preserved.
+        Assert.Equal(triageVerdict.Action, capturedVerdict.Action);
+        Assert.Equal(triageVerdict.Why, capturedVerdict.Why);
+        Assert.Equal(triageVerdict.Confidence, capturedVerdict.Confidence);
+    }
+
+    [Fact]
+    public async Task FirstEvent_EmptyPreRunSummary_KeepsTriageVerdictSummary()
+    {
+        // Pre-run produced no summary (model failure, schema mismatch, etc.) — the triage
+        // verdict's summary stays in the push so the phone still shows something useful.
+        var branch = Branch();
+
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PreRunResult(true, ""));
+
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(true);
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
+
+        TriageVerdict? capturedVerdict = null;
+        _pusher.Setup(p => p.PushSessionLinkAsync(It.IsAny<string>(), branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string _, BranchInfo _, string _, TriageVerdict v, CancellationToken _) => capturedVerdict = v)
+            .Returns(Task.CompletedTask);
+
+        var triageVerdict = TriageVerdict.Actionable("test", "fix the thing");
+        await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, triageVerdict, default);
+
+        Assert.Equal("fix the thing", capturedVerdict!.Summary);
     }
 
     [Fact]
@@ -336,7 +395,7 @@ public class DispatcherTests : IDisposable
                 var snapshot = await _store.GetBranchStateAsync(b.Key, default);
                 sidVisibleToPreRun = snapshot?.SessionId;
             })
-            .ReturnsAsync(true);
+            .ReturnsAsync(new PreRunResult(true, ""));
 
         _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((BranchInfo _, string? sid, CancellationToken _) => Att(sessionId: sid ?? "(none)"));
@@ -357,10 +416,8 @@ public class DispatcherTests : IDisposable
             .ThrowsAsync(new TimeoutException("bridgeSessionId not populated within 5s for claude PID 13796"));
 
         string? capturedUrl = null;
-        _pusher.Setup(p => p.PushSessionLinkAsync(
-                It.IsAny<string>(), branch, It.IsAny<GhNotification>(),
-                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
-            .Callback((string url, BranchInfo _, GhNotification _, TriageVerdict _, CancellationToken _) => capturedUrl = url)
+        _pusher.Setup(p => p.PushSessionLinkAsync(It.IsAny<string>(), branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string url, BranchInfo _, string _, TriageVerdict _, CancellationToken _) => capturedUrl = url)
             .Returns(Task.CompletedTask);
 
         var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
@@ -369,8 +426,7 @@ public class DispatcherTests : IDisposable
 
         // The same PushSessionLinkAsync method fires, but with "Not Available" in the URL
         // slot — NtfyPusher uses that as the cue to suppress the click/action button.
-        _pusher.Verify(p => p.PushSessionLinkAsync(
-            It.IsAny<string>(), branch, It.IsAny<GhNotification>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
+        _pusher.Verify(p => p.PushSessionLinkAsync(It.IsAny<string>(), branch, It.IsAny<string>(), It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
             Times.Once);
         Assert.Equal("Not Available", capturedUrl);
 

@@ -17,7 +17,7 @@ public interface ITriagePipeline
     /// counter is already at or above the cap. The increment is the worker's responsibility,
     /// applied only after a successful dispatch so dropped notifications don't burn budget.
     /// </summary>
-    Task<(TriageVerdict? Verdict, string CommentBody)> QuickTriageAsync(
+    Task<(TriageVerdict? Verdict, string CommentBody, string CommentAuthor)> QuickTriageAsync(
         GhNotification notification,
         CancellationToken cancellationToken);
 

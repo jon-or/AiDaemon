@@ -42,8 +42,11 @@ public class Dispatcher : IDispatcher
         if (items.Count == 0)
             throw new ArgumentException("Dispatch requires at least one notification.", nameof(items));
 
-        // Use the most-recent notification for any "primary" metadata (push title, etc.).
-        var primary = items.OrderByDescending(i => i.Notification.UpdatedAt).First().Notification;
+        // Most-recent notification's subject title — what the conversation is "about" on
+        // GitHub. Surfaces as the ntfy push title so the user reads the issue/PR name
+        // rather than the branch slug.
+        var subjectTitle = items.OrderByDescending(i => i.Notification.UpdatedAt)
+            .First().Notification.Subject.Title;
 
         var key = branch.Key;
         var rec = await _store.GetBranchStateAsync(key, cancellationToken)
@@ -71,7 +74,7 @@ public class Dispatcher : IDispatcher
         {
             rec.LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
-            await _pusher.PushHeadsUpAsync(rec.RcUrl ?? "", branch, primary, verdict, cancellationToken);
+            await _pusher.PushHeadsUpAsync(rec.RcUrl ?? "", branch, subjectTitle, verdict, cancellationToken);
             _logger.LogInformation(
                 "dispatch=heads_up branch={Branch} url={Url}", key, rec.RcUrl);
             return DispatchOutcome.HeadsUp;
@@ -101,6 +104,7 @@ public class Dispatcher : IDispatcher
         //   * Fresh pre-run — generate a new session id, run the headless pre-run agent in the
         //     worktree to do the research/fix work, then RC resumes that session.
         var seedSid = string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId;
+        var preRunSummary = "";
 
         if (seedSid == null)
         {
@@ -121,7 +125,8 @@ public class Dispatcher : IDispatcher
 
             try
             {
-                await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
+                var preRun = await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
+                preRunSummary = preRun.Summary;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -154,6 +159,13 @@ public class Dispatcher : IDispatcher
                 seedSid, key);
         }
 
+        // The pre-run's summary credits the requester by name and describes both ask + work
+        // done; prefer it over the triage verdict's terser one-liner whenever it landed.
+        // Cross-tick resume / heads-up paths skip pre-run, so verdict.Summary stands.
+        var pushVerdict = string.IsNullOrEmpty(preRunSummary)
+            ? verdict
+            : verdict with { Summary = preRunSummary };
+
         RcAttachment attachment;
         try
         {
@@ -171,10 +183,9 @@ public class Dispatcher : IDispatcher
 
             // Push anyway — the user still needs to know an actionable thing arrived even if
             // the RC relay is down. Same shape as a normal session-link push, but with
-            // "Not Available" in the URL slot — NtfyPusher recognizes that as a non-real URL
-            // and suppresses the click/action button while still surfacing the status in the
-            // push body.
-            await _pusher.PushSessionLinkAsync("Not Available", branch, primary, verdict, cancellationToken);
+            // "Not Available" in the URL slot. Use pushVerdict so the pre-run's summary
+            // (if it produced one before the spawn failed) still surfaces on the phone.
+            await _pusher.PushSessionLinkAsync("Not Available", branch, subjectTitle, pushVerdict, cancellationToken);
 
             return DispatchOutcome.Failed;
         }
@@ -189,7 +200,7 @@ public class Dispatcher : IDispatcher
         rec.LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         await _store.UpsertBranchStateAsync(rec, cancellationToken);
-        await _pusher.PushSessionLinkAsync(attachment.Url, branch, primary, verdict, cancellationToken);
+        await _pusher.PushSessionLinkAsync(attachment.Url, branch, subjectTitle, pushVerdict, cancellationToken);
 
         _logger.LogInformation(
             "dispatch=spawned branch={Branch} sid={Sid} bridge={Bridge} url={Url}",

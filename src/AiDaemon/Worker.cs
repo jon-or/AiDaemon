@@ -241,9 +241,10 @@ public class Worker : BackgroundService
             // re-fetch).
             TriageVerdict? quick;
             string commentBody;
+            string commentAuthor;
             try
             {
-                (quick, commentBody) = await _triage.QuickTriageAsync(n, cancellationToken);
+                (quick, commentBody, commentAuthor) = await _triage.QuickTriageAsync(n, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -307,7 +308,7 @@ public class Worker : BackgroundService
                 byBranch[branch.Key] = batch;
             }
 
-            batch.Items.Add(new NotificationWithBody(n, commentBody));
+            batch.Items.Add(new NotificationWithBody(n, commentBody, commentAuthor));
         }
 
         // ============================================================================
@@ -346,8 +347,8 @@ public class Worker : BackgroundService
             // whether dispatch ultimately succeeds; the work of grouping them happened.
             coalesced += batch.Items.Count - 1;
             _logger.LogInformation(
-                "verdict branch={Branch} count={Count} action=Actionable summary={Summary} why={Why} confidence={Confidence:F2}",
-                branchKey, batch.Items.Count, verdict.Summary, verdict.Why, verdict.Confidence);
+                "verdict branch={Branch} count={Count} action=Actionable why={Why} confidence={Confidence:F2}",
+                branchKey, batch.Items.Count, verdict.Why, verdict.Confidence);
 
             DispatchOutcome dispatchOutcome;
             try

@@ -1,10 +1,9 @@
 {
   "type": "object",
-  "required": ["action", "confidence", "summary", "why"],
+  "required": ["action", "confidence", "why"],
   "properties": {
     "action": { "enum": ["actionable", "drop"] },
     "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-    "summary": { "type": "string", "maxLength": 200 },
     "why": { "type": "string", "maxLength": 200 }
   },
   "additionalProperties": false

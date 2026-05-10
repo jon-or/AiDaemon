@@ -100,7 +100,7 @@ public class WorkerTests
         StubPoller(n1, n2);
 
         _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((GhNotification _, CancellationToken _) => (null, "body"));
+            .ReturnsAsync((GhNotification _, CancellationToken _) => (null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(SameBranch());
 
@@ -177,7 +177,7 @@ public class WorkerTests
         _triage.Setup(t => t.QuickTriageAsync(
                 It.Is<GhNotification>(g => g.Id == "thread-B"),
                 It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("L1 unsupported"), ""));
+            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("L1 unsupported"), "", "alice"));
 
         _store.Setup(s => s.MarkProcessedAsync(
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
@@ -213,7 +213,7 @@ public class WorkerTests
         StubPoller(n);
 
         _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)null, "body"));
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(SameBranch());
         _triage.Setup(t => t.AgentTriageAsync(
@@ -251,7 +251,7 @@ public class WorkerTests
         StubPoller(n1, n2);
 
         _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)null, "body"));
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(SameBranch());
         _triage.Setup(t => t.AgentTriageAsync(
@@ -297,7 +297,7 @@ public class WorkerTests
         StubPoller(n1, n2);
 
         _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)null, "body"));
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(SameBranch());
         _triage.Setup(t => t.AgentTriageAsync(
@@ -337,10 +337,10 @@ public class WorkerTests
 
         _triage.Setup(t => t.QuickTriageAsync(
                 It.Is<GhNotification>(g => g.Id == "thread-DROP"), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("noise"), ""));
+            .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("noise"), "", "alice"));
         _triage.Setup(t => t.QuickTriageAsync(
                 It.Is<GhNotification>(g => g.Id == "thread-GO"), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)null, "body"));
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(SameBranch());
         _triage.Setup(t => t.AgentTriageAsync(
@@ -465,7 +465,7 @@ public class WorkerTests
         StubPoller(n);
 
         _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(((TriageVerdict?)null, "body"));
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("git wedged"));
         _store.Setup(s => s.MarkProcessedAsync(

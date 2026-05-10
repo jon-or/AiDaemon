@@ -33,6 +33,7 @@
     <EmbeddedResource Include="Triage\system-prompt.md" />
     <EmbeddedResource Include="Triage\pre-run-prompt.md" />
     <EmbeddedResource Include="Triage\schema.json" />
+    <EmbeddedResource Include="Triage\pre-run-schema.json" />
   </ItemGroup>
 
   <ItemGroup>

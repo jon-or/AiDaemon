@@ -62,14 +62,14 @@ public class TriagePipeline : ITriagePipeline
         _botBlocklist = new HashSet<string>(_options.BotAuthorBlocklist, StringComparer.OrdinalIgnoreCase);
     }
 
-    public async Task<(TriageVerdict? Verdict, string CommentBody)> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
+    public async Task<(TriageVerdict? Verdict, string CommentBody, string CommentAuthor)> QuickTriageAsync(GhNotification n, CancellationToken cancellationToken)
     {
         // ---------- L1: type / reason / rate / author ----------
         if (!SupportedSubjectTypes.Contains(n.Subject.Type))
-            return (TriageVerdict.Drop($"unsupported subject type: {n.Subject.Type}"), "");
+            return (TriageVerdict.Drop($"unsupported subject type: {n.Subject.Type}"), "", "");
 
         if (!_actionableReasons.Contains(n.Reason))
-            return (TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons"), "");
+            return (TriageVerdict.Drop($"reason '{n.Reason}' not in ActionableReasons"), "", "");
 
         // Rate-limit is checked read-only here — the count records dispatched actions, not
         // notifications considered, so the increment lives at the dispatch decision in the
@@ -82,11 +82,12 @@ public class TriagePipeline : ITriagePipeline
                 "rate-limit drop thread={ThreadId} count={Count} max={Max}",
                 n.Id, currentCount, _options.Triage.MaxActionsPerThreadPerDay);
             return (TriageVerdict.Drop(
-                $"thread daily rate limit ({currentCount}/{_options.Triage.MaxActionsPerThreadPerDay})"), "");
+                $"thread daily rate limit ({currentCount}/{_options.Triage.MaxActionsPerThreadPerDay})"), "", "");
         }
 
-        // L1 author check requires the comment body. Fetch once; the body is also returned
-        // so callers can pass it through to the agent without re-fetching the same URL.
+        // L1 author check requires the comment body. Fetch once; the body + author are
+        // also returned so callers can pass them through to the agent without re-fetching
+        // (and so the pre-run can credit the requester by name in its summary).
         CommentInfo? comment = null;
         if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
             comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
@@ -96,21 +97,21 @@ public class TriagePipeline : ITriagePipeline
 
         if (!string.IsNullOrEmpty(_options.AiUserLogin) &&
             string.Equals(author, _options.AiUserLogin, StringComparison.OrdinalIgnoreCase))
-            return (TriageVerdict.Drop($"self-authored by {author}"), body);
+            return (TriageVerdict.Drop($"self-authored by {author}"), body, author);
 
         if (!string.IsNullOrEmpty(author) && _botBlocklist.Contains(author))
-            return (TriageVerdict.Drop($"blocklisted bot author: {author}"), body);
+            return (TriageVerdict.Drop($"blocklisted bot author: {author}"), body, author);
 
         // ---------- L2: regex content filter ----------
         var stripped = StripQuotedReplies(body);
         foreach (var pat in _l2Patterns.Value)
         {
             if (pat.IsMatch(stripped))
-                return (TriageVerdict.Drop($"L2 regex match: /{pat}/"), body);
+                return (TriageVerdict.Drop($"L2 regex match: /{pat}/"), body, author);
         }
 
         // Defer to agent triage.
-        return (null, body);
+        return (null, body, author);
     }
 
     public async Task<TriageVerdict> AgentTriageAsync(IReadOnlyList<NotificationWithBody> items, BranchInfo branch, CancellationToken cancellationToken)
@@ -124,9 +125,6 @@ public class TriagePipeline : ITriagePipeline
         var scratchDir = Path.Combine(_options.DataDir, "triage-scratch");
 
         var userInput = BuildAgentInput(items, branch);
-
-        // Use the most-recent notification's title for fallback summary text.
-        var primary = items.OrderByDescending(i => i.Notification.UpdatedAt).First();
 
         ClaudeJsonResult result;
         try
@@ -147,7 +145,7 @@ public class TriagePipeline : ITriagePipeline
             _logger.LogWarning(ex,
                 "agent triage failed branch={Branch} count={Count} — defaulting to actionable",
                 branch.Key, items.Count);
-            return DefaultActionable(primary, $"agent error ({ex.GetType().Name}) — actionable by default");
+            return DefaultActionable($"agent error ({ex.GetType().Name}) — actionable by default");
         }
 
         if (result.IsError)
@@ -155,7 +153,7 @@ public class TriagePipeline : ITriagePipeline
             _logger.LogWarning(
                 "agent triage is_error=true branch={Branch} count={Count} result={Result} — defaulting to actionable",
                 branch.Key, items.Count, result.Result);
-            return DefaultActionable(primary, "agent reported is_error=true — actionable by default");
+            return DefaultActionable("agent reported is_error=true — actionable by default");
         }
 
         TriageStructuredOutput? llm = null;
@@ -175,7 +173,7 @@ public class TriagePipeline : ITriagePipeline
         {
             _logger.LogWarning(
                 "agent triage returned no structured output branch={Branch} — defaulting to actionable", branch.Key);
-            return DefaultActionable(primary, "agent returned no structured output — actionable by default");
+            return DefaultActionable("agent returned no structured output — actionable by default");
         }
 
         // Trust the agent's verdict directly — no post-hoc bias rule.
@@ -183,7 +181,10 @@ public class TriagePipeline : ITriagePipeline
             ? TriageAction.Drop
             : TriageAction.Actionable;
 
-        var verdict = new TriageVerdict(action, llm.Why, llm.Summary, llm.Confidence);
+        // Triage no longer produces a `summary` — that's the pre-run agent's job. Push body
+        // shows the raw branch line + (when pre-run runs) the pre-run's summary; heads-up /
+        // cross-tick paths skip pre-run and the body is just the branch line.
+        var verdict = new TriageVerdict(action, llm.Why, Summary: "", llm.Confidence);
 
         _logger.LogInformation(
             "L3 verdict branch={Branch} count={Count} action={Action} confidence={Confidence:F2} why={Why}",
@@ -238,14 +239,8 @@ public class TriagePipeline : ITriagePipeline
         return sb.ToString();
     }
 
-    static string TruncateSummary(string s)
-        => string.IsNullOrEmpty(s) ? "(no summary)" : (s.Length <= 200 ? s : s[..200]);
-
-    static TriageVerdict DefaultActionable(NotificationWithBody primary, string why)
-        => TriageVerdict.Actionable(
-            why,
-            summary: TruncateSummary(primary.Notification.Subject.Title),
-            confidence: 0.5);
+    static TriageVerdict DefaultActionable(string why)
+        => TriageVerdict.Actionable(why, summary: "", confidence: 0.5);
 
     /// <summary>
     /// Strips GitHub quoted-reply lines (lines starting with <c>&gt;</c>) and the immediately

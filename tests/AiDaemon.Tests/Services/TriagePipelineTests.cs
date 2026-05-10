@@ -84,14 +84,13 @@ public class TriagePipelineTests : IDisposable
             });
     }
 
-    void StubAgent(string action, double confidence, string why = "test", string summary = "")
+    void StubAgent(string action, double confidence, string why = "test")
     {
         var json = JsonSerializer.SerializeToElement(new
         {
             action,
             confidence,
             why,
-            summary = string.IsNullOrEmpty(summary) ? "stubbed" : summary,
         });
 
         _claude.Setup(c => c.RunHeadlessJsonAsync(
@@ -107,7 +106,7 @@ public class TriagePipelineTests : IDisposable
     [Fact]
     public async Task Quick_DropsUnsupportedSubjectType()
     {
-        var (v, body) = await _pipeline.QuickTriageAsync(N(type: "CheckSuite"), default);
+        var (v, body, _) = await _pipeline.QuickTriageAsync(N(type: "CheckSuite"), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("unsupported subject type", v.Why);
@@ -117,7 +116,7 @@ public class TriagePipelineTests : IDisposable
     [Fact]
     public async Task Quick_DropsReasonNotInActionableList()
     {
-        var (v, _) = await _pipeline.QuickTriageAsync(N(reason: "subscribed"), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(reason: "subscribed"), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("ActionableReasons", v.Why);
@@ -127,7 +126,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_ReturnsBodyAlongsideVerdict_OnBotDrop()
     {
         StubComment("any body", author: "dependabot[bot]");
-        var (v, body) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, body, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Equal("any body", body);  // body fetched + returned even on bot-drop
@@ -137,7 +136,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_DropsSelfAuthored()
     {
         StubComment("any body", author: "jon-or-ai");
-        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("self-authored", v.Why);
@@ -147,7 +146,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_DropsBotAuthor()
     {
         StubComment("any body", author: "dependabot[bot]");
-        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("blocklisted bot author", v.Why);
@@ -164,7 +163,7 @@ public class TriagePipelineTests : IDisposable
         for (var i = 0; i < _options.Triage.MaxActionsPerThreadPerDay; i++)
             await _store.IncrementRateLimitAsync("thread-1", today, default);
 
-        var (capped, body) = await _pipeline.QuickTriageAsync(N(), default);
+        var (capped, body, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(capped);
         Assert.Equal(TriageAction.Drop, capped!.Action);
         Assert.Contains("rate limit", capped.Why, StringComparison.OrdinalIgnoreCase);
@@ -190,7 +189,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_PassedToL3_DoesNotChargeRateLimit()
     {
         StubComment("substantive question that needs the agent");
-        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.Null(v);
 
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
@@ -206,7 +205,7 @@ public class TriagePipelineTests : IDisposable
     public async Task Quick_DropsNoiseRegex(string body)
     {
         StubComment(body);
-        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
@@ -217,7 +216,7 @@ public class TriagePipelineTests : IDisposable
     {
         var body = "> earlier text\n> more quoted text\n\nlgtm";
         StubComment(body);
-        var (v, _) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, _, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.NotNull(v);
         Assert.Equal(TriageAction.Drop, v!.Action);
         Assert.Contains("L2 regex", v.Why);
@@ -228,7 +227,7 @@ public class TriagePipelineTests : IDisposable
     {
         // Real, substantive comment body that isn't noise — should bubble up to L3.
         StubComment("can you bump the timeout in foo.cs to 30s?");
-        var (v, body) = await _pipeline.QuickTriageAsync(N(), default);
+        var (v, body, _) = await _pipeline.QuickTriageAsync(N(), default);
         Assert.Null(v);
         Assert.Equal("can you bump the timeout in foo.cs to 30s?", body);
     }
@@ -286,16 +285,17 @@ public class TriagePipelineTests : IDisposable
     [Fact]
     public async Task Agent_LowConfidenceDrop_StillHonoredAsDrop()
     {
-        // No bias rule — the LLM's verdict is taken directly. Also pin the verdict mapping
-        // so a regression in llm.Confidence/llm.Summary plumbing fails this test.
-        StubAgent("drop", 0.6, why: "borderline", summary: "marker-summary");
+        // No bias rule — the LLM's verdict is taken directly. Pin the verdict mapping
+        // (action / confidence / why) so a regression in plumbing fails this test.
+        StubAgent("drop", 0.6, why: "borderline");
 
         var v = await _pipeline.AgentTriageAsync(new[] { new NotificationWithBody(N(), "test body") }, Branch(), default);
 
         Assert.Equal(TriageAction.Drop, v.Action);
         Assert.Equal(0.6, v.Confidence);
-        Assert.Equal("marker-summary", v.Summary);
         Assert.Equal("borderline", v.Why);
+        // Triage no longer produces a summary — pre-run owns that field now.
+        Assert.Equal("", v.Summary);
     }
 
     [Fact]
@@ -354,7 +354,7 @@ public class TriagePipelineTests : IDisposable
             .Callback((string _, string userInput, string _, string _, string _, TimeSpan _, CancellationToken _, string? _, string? _) =>
                 capturedUserInput = userInput)
             .ReturnsAsync(new ClaudeJsonResult(false, "",
-                JsonSerializer.SerializeToElement(new { action = "actionable", confidence = 0.9, why = "x", summary = "x" }),
+                JsonSerializer.SerializeToElement(new { action = "actionable", confidence = 0.9, why = "x" }),
                 "end_turn", 100));
 
         var older = new GhNotification

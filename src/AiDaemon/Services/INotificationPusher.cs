@@ -10,20 +10,23 @@ public interface INotificationPusher
     /// still goes out so the user sees the actionable event, and the pusher omits the click
     /// target instead of producing an untappable button.
     /// </summary>
+    /// <param name="subjectTitle">The GitHub issue/PR title — used as the ntfy push title.
+    /// Falls back to the branch name when empty.</param>
     Task PushSessionLinkAsync(
         string url,
         BranchInfo branch,
-        GhNotification notification,
+        string subjectTitle,
         TriageVerdict verdict,
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Followup for an already-active RC session. Same URL, lower priority, "heads-up" prefix.
+    /// Followup for an already-active RC session. Same URL, lower priority, no prefix change
+    /// (priority alone distinguishes the two on the phone).
     /// </summary>
     Task PushHeadsUpAsync(
         string url,
         BranchInfo branch,
-        GhNotification notification,
+        string subjectTitle,
         TriageVerdict verdict,
         CancellationToken cancellationToken);
 }
@@ -43,22 +46,22 @@ public class NoopNotificationPusher : INotificationPusher
     }
 
     public Task PushSessionLinkAsync(
-        string url, BranchInfo branch, GhNotification notification, TriageVerdict verdict,
+        string url, BranchInfo branch, string subjectTitle, TriageVerdict verdict,
         CancellationToken cancellationToken)
     {
         _logger.LogInformation(
             "[push] session-link branch={Branch} url={Url} title={Title} summary={Summary}",
-            branch.Key, url, notification.Subject.Title, verdict.Summary);
+            branch.Key, url, subjectTitle, verdict.Summary);
         return Task.CompletedTask;
     }
 
     public Task PushHeadsUpAsync(
-        string url, BranchInfo branch, GhNotification notification, TriageVerdict verdict,
+        string url, BranchInfo branch, string subjectTitle, TriageVerdict verdict,
         CancellationToken cancellationToken)
     {
         _logger.LogInformation(
             "[push] heads-up branch={Branch} url={Url} title={Title} summary={Summary}",
-            branch.Key, url, notification.Subject.Title, verdict.Summary);
+            branch.Key, url, subjectTitle, verdict.Summary);
         return Task.CompletedTask;
     }
 }

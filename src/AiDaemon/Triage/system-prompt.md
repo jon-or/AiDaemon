@@ -31,12 +31,6 @@ Control session for the user to take over.
 A number in [0, 1] capturing how sure you are. Audit-only — does not
 affect dispatch.
 
-## summary
-
-One sentence (≤ 200 chars) describing what the user will see on their
-phone notification when they're paged. Lead with the verb the user
-would take.
-
 ## why
 
 One short clause justifying the action you chose, intended for audit
@@ -48,7 +42,6 @@ logging.
 {
   "action": "drop",
   "confidence": 0.95,
-  "summary": "Reviewer said \"lgtm\" — no follow-up needed.",
   "why": "Pure approval, no question or change request."
 }
 ```
@@ -57,7 +50,6 @@ logging.
 {
   "action": "actionable",
   "confidence": 0.95,
-  "summary": "Fix file-scoped namespace style in LinkedAvailabilityDPStatus.cs (claude[bot] review).",
   "why": "Code review asks for a specific style-guide correction with the corrected code provided."
 }
 ```

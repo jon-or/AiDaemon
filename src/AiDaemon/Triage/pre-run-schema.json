@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "required": ["summary"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 280,
+      "description": "1-2 short sentences. MUST name the requester (the GitHub user who posted the comment) and describe both what was requested and what was done. Example: 'Claude Bot requested several syntax changes including root namespaces. I've made the requested changes — ready for you to review.'"
+    }
+  },
+  "additionalProperties": false
+}

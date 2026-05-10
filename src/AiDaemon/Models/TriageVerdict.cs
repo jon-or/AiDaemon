@@ -30,9 +30,6 @@ public class TriageStructuredOutput
     [JsonPropertyName("confidence")]
     public double Confidence { get; set; }
 
-    [JsonPropertyName("summary")]
-    public string Summary { get; set; } = "";
-
     [JsonPropertyName("why")]
     public string Why { get; set; } = "";
 }

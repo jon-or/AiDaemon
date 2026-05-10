@@ -23,6 +23,13 @@ namespace AiDaemon.Services;
 /// </remarks>
 public class NtfyPusher : INotificationPusher
 {
+    /// <summary>
+    /// Fallback target for the "Open Claude" action button when the RC relay is down. Drops
+    /// the user at the claude.ai code home where they can find their session manually
+    /// (better than a broken link, broken enough that they immediately know RC was down).
+    /// </summary>
+    internal const string ClaudeFallbackUrl = "https://claude.ai/code";
+
     readonly HttpClient _http;
     readonly DaemonOptions _options;
     readonly ILogger<NtfyPusher> _logger;
@@ -35,64 +42,98 @@ public class NtfyPusher : INotificationPusher
     }
 
     public Task PushSessionLinkAsync(
-        string url, BranchInfo branch, GhNotification notification, TriageVerdict verdict,
+        string url, BranchInfo branch, string subjectTitle, TriageVerdict verdict,
         CancellationToken cancellationToken)
         => PostAsync(
-            title: BuildTitle(branch, verdict, prefix: ""),
-            message: BuildBody(notification, verdict, url),
+            title: BuildTitle(branch, subjectTitle),
+            message: BuildBody(branch, verdict, url),
             priority: _options.Ntfy.PriorityHigh,
-            clickUrl: url,
-            actionLabel: "Open session",
+            branch: branch,
+            sessionUrl: url,
             cancellationToken: cancellationToken);
 
     public Task PushHeadsUpAsync(
-        string url, BranchInfo branch, GhNotification notification, TriageVerdict verdict,
+        string url, BranchInfo branch, string subjectTitle, TriageVerdict verdict,
         CancellationToken cancellationToken)
         => PostAsync(
-            title: BuildTitle(branch, verdict, prefix: "[update] "),
-            message: BuildBody(notification, verdict, url),
+            title: BuildTitle(branch, subjectTitle),
+            message: BuildBody(branch, verdict, url),
             priority: _options.Ntfy.PriorityNormal,
-            clickUrl: url,
-            actionLabel: "Resume session",
+            branch: branch,
+            sessionUrl: url,
             cancellationToken: cancellationToken);
 
-    static string BuildTitle(BranchInfo branch, TriageVerdict verdict, string prefix)
+    /// <summary>
+    /// Title is the GitHub issue/PR title — what the conversation is actually about. Falls
+    /// back to the branch name when no subject title was supplied (defensive; in practice
+    /// the dispatcher always has one). PriorityHigh vs PriorityNormal distinguishes a
+    /// fresh spawn from a heads-up.
+    /// </summary>
+    static string BuildTitle(BranchInfo branch, string subjectTitle)
     {
-        var summary = string.IsNullOrWhiteSpace(verdict.Summary) ? "" : $" {verdict.Summary}";
-        // ntfy renders titles in roughly one line on iOS; cap so the suffix doesn't get lost
-        // behind a long branch slug + summary.
-        return $"{prefix}[{branch.Repo}:{branch.Branch}]{summary}".TruncateWithEllipsis(120);
+        var title = string.IsNullOrWhiteSpace(subjectTitle) ? branch.Branch : subjectTitle;
+        return title.TruncateWithEllipsis(120);
     }
 
-    static string BuildBody(GhNotification notification, TriageVerdict verdict, string url)
+    /// <summary>
+    /// Markdown body. Branch (qualified <c>repo:branch</c>) goes first as an inline-code
+    /// span — visually subordinate to the title and the summary, but still readable. The
+    /// summary itself may contain markdown the pre-run agent emitted (bold for the
+    /// requester's name, code spans for filenames, etc.). The "Session Not Available" line
+    /// only appears when the RC relay is down — when a real URL is in hand, the Open
+    /// Claude button covers it.
+    /// </summary>
+    static string BuildBody(BranchInfo branch, TriageVerdict verdict, string url)
     {
-        // Lead with the GitHub subject so the push shows what the conversation is about even
-        // when Why is just a short tag (e.g. "review_requested" with no L3 reasoning).
-        var subject = notification.Subject.Title;
         var sb = new System.Text.StringBuilder();
-        if (!string.IsNullOrWhiteSpace(subject))
-            sb.Append(subject);
+        sb.Append('`').Append(branch.Repo).Append(':').Append(branch.Branch).Append('`');
 
-        // When the URL isn't a real https link (the dispatcher passes "Not Available" when
-        // the RC relay is down), surface that in the body — the click/action button is
-        // suppressed in PostAsync so the body is the only place the user sees the status.
+        if (!string.IsNullOrWhiteSpace(verdict.Summary))
+            sb.Append("\n\n").Append(verdict.Summary);
+
         if (!IsRealUrl(url))
-        {
-            if (sb.Length > 0) sb.Append("\n\n");
-            sb.Append("Session: ").Append(string.IsNullOrWhiteSpace(url) ? "Not Available" : url);
-        }
-
-        if (!string.IsNullOrWhiteSpace(verdict.Why))
-        {
-            if (sb.Length > 0) sb.Append("\n\n");
-            sb.Append(verdict.Why);
-        }
+            sb.Append("\n\n_Session Not Available_");
 
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Builds the action-button strip: Open PR (when the branch resolved to a PR), Open
+    /// Issue (when it resolved to an issue), Open Claude (always, RC URL or fallback).
+    /// ntfy supports up to 3 custom view actions per notification — exactly enough.
+    /// </summary>
+    static NtfyAction[] BuildActions(BranchInfo branch, string sessionUrl)
+    {
+        var list = new List<NtfyAction>(3);
+
+        if (branch.PrNumber is int pr)
+            list.Add(new NtfyAction
+            {
+                Action = "view",
+                Label = "Open PR",
+                Url = $"https://github.com/{branch.Repo}/pull/{pr}",
+            });
+
+        if (branch.IssueNumber is int issue)
+            list.Add(new NtfyAction
+            {
+                Action = "view",
+                Label = "Open Issue",
+                Url = $"https://github.com/{branch.Repo}/issues/{issue}",
+            });
+
+        list.Add(new NtfyAction
+        {
+            Action = "view",
+            Label = "Open Claude",
+            Url = IsRealUrl(sessionUrl) ? sessionUrl : ClaudeFallbackUrl,
+        });
+
+        return list.ToArray();
+    }
+
     async Task PostAsync(
-        string title, string message, int priority, string clickUrl, string actionLabel,
+        string title, string message, int priority, BranchInfo branch, string sessionUrl,
         CancellationToken cancellationToken)
     {
         var topic = _options.Ntfy.Topic;
@@ -104,25 +145,19 @@ public class NtfyPusher : INotificationPusher
             return;
         }
 
+        // Deliberately omit `click` so the ntfy app doesn't auto-render the COPY LINK /
+        // OPEN LINK buttons it generates from a click target — the three custom actions
+        // (Open PR / Open Issue / Open Claude) are the only buttons we want.
         var payload = new NtfyPayload
         {
             Topic = topic,
             Title = title,
             Message = message,
+            Markdown = true,
             Priority = priority,
             Tags = new[] { "robot" },
+            Actions = BuildActions(branch, sessionUrl),
         };
-
-        // Only set click/actions when we have a real URL — passing "Not Available" or empty
-        // through to ntfy would render an action button that opens nowhere.
-        if (IsRealUrl(clickUrl))
-        {
-            payload.Click = clickUrl;
-            payload.Actions = new[]
-            {
-                new NtfyAction { Action = "view", Label = actionLabel, Url = clickUrl },
-            };
-        }
 
         var server = string.IsNullOrEmpty(_options.Ntfy.Server) ? "https://ntfy.sh" : _options.Ntfy.Server;
         var requestUri = server.TrimEnd('/') + "/";
@@ -159,6 +194,11 @@ public class NtfyPusher : INotificationPusher
 
         [JsonPropertyName("message")]
         public string Message { get; set; } = "";
+
+        // ntfy renders the message as markdown when this is true (CommonMark + GFM,
+        // per https://docs.ntfy.sh/publish/#markdown-formatting).
+        [JsonPropertyName("markdown")]
+        public bool Markdown { get; set; }
 
         [JsonPropertyName("priority")]
         public int Priority { get; set; }

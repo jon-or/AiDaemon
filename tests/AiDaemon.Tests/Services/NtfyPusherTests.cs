@@ -33,23 +33,18 @@ public class NtfyPusherTests
         return new NtfyPusher(http, Options.Create(_options), NullLogger<NtfyPusher>.Instance);
     }
 
-    static BranchInfo Branch(string repo = "ownerrez/orez", string branch = "16119-isdpvirtualproperty")
-        => new(repo, branch, @"D:\git\orez.worktrees\16119-isdpvirtualproperty", PrNumber: null, IssueNumber: 16119);
-
-    static GhNotification Notification(string title = "Bug in DP multiplier")
-        => new()
-        {
-            Id = "23420840455",
-            Reason = "mention",
-            Subject = new GhNotificationSubject { Title = title, Type = "Issue", Url = "https://api.github.com/repos/ownerrez/orez/issues/16119" },
-            Repository = new GhRepositoryRef { FullName = "ownerrez/orez" },
-        };
+    static BranchInfo Branch(
+        string repo = "ownerrez/orez",
+        string branch = "16119-isdpvirtualproperty",
+        int? prNumber = null,
+        int? issueNumber = 16119)
+        => new(repo, branch, @"D:\git\orez.worktrees\16119-isdpvirtualproperty", prNumber, issueNumber);
 
     [Fact]
     public async Task PushSessionLink_PostsToServerRoot_WithJsonContentType()
     {
         await Build().PushSessionLinkAsync(
-            "http://172.16.5.10:1234", Branch(), Notification(),
+            "http://172.16.5.10:1234", Branch(), "Test subject",
             TriageVerdict.Actionable("user asked a question"), default);
 
         Assert.Single(_handler.Calls);
@@ -60,10 +55,11 @@ public class NtfyPusherTests
     }
 
     [Fact]
-    public async Task PushSessionLink_BodyContainsTopic_Title_Priority_TagsRobot_ClickAndAction()
+    public async Task PushSessionLink_TitleIsSubject_BodyHasMarkdownBranchAndSummary_HighPriority_RobotTag()
     {
         await Build().PushSessionLinkAsync(
-            "http://172.16.5.10:1234", Branch(), Notification("DP multiplier wrong on virtual"),
+            "https://claude.ai/code/session_01ABC", Branch(issueNumber: 16119),
+            "DP multiplier wrong on virtual properties",
             TriageVerdict.Actionable("question on virtual properties", summary: "Investigate DP fix"),
             default);
 
@@ -71,69 +67,172 @@ public class NtfyPusherTests
 
         Assert.Equal("secret-topic-uuid", json.GetProperty("topic").GetString());
         Assert.Equal(4, json.GetProperty("priority").GetInt32());
-        Assert.Equal("[ownerrez/orez:16119-isdpvirtualproperty] Investigate DP fix",
-            json.GetProperty("title").GetString());
-        // Body leads with the GitHub subject; verdict.Why follows after a blank line.
-        Assert.Contains("DP multiplier wrong on virtual", json.GetProperty("message").GetString());
-        Assert.Contains("question on virtual properties", json.GetProperty("message").GetString());
+        // Title: the GitHub issue/PR title, not the branch.
+        Assert.Equal("DP multiplier wrong on virtual properties", json.GetProperty("title").GetString());
+
+        // markdown=true so ntfy renders the body's code spans / italics on the phone.
+        Assert.True(json.GetProperty("markdown").GetBoolean());
+
+        // Body: branch as inline code (renders smaller / monospace on the phone), then
+        // summary. No Session line when the URL is real — Open Claude button covers it.
+        var body = json.GetProperty("message").GetString()!;
+        Assert.Equal(
+            "`ownerrez/orez:16119-isdpvirtualproperty`\n\nInvestigate DP fix",
+            body);
 
         var tags = json.GetProperty("tags").EnumerateArray().Select(e => e.GetString()).ToArray();
         Assert.Equal(new[] { "robot" }, tags);
-
-        Assert.Equal("http://172.16.5.10:1234", json.GetProperty("click").GetString());
-
-        var actions = json.GetProperty("actions").EnumerateArray().ToList();
-        Assert.Single(actions);
-        Assert.Equal("view", actions[0].GetProperty("action").GetString());
-        Assert.Equal("Open session", actions[0].GetProperty("label").GetString());
-        Assert.Equal("http://172.16.5.10:1234", actions[0].GetProperty("url").GetString());
     }
 
     [Fact]
-    public async Task PushHeadsUp_UsesUpdatePrefix_AndNormalPriority()
+    public async Task PushSessionLink_NoSubjectTitle_FallsBackToBranchName()
     {
+        // Defensive: empty subject title (notification with no subject — rare) → push
+        // title falls back to the branch slug so the user still sees something.
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(), "",
+            TriageVerdict.Actionable("ok"), default);
+
+        var title = ParseBody(_handler.Calls[0].Body).GetProperty("title").GetString();
+        Assert.Equal("16119-isdpvirtualproperty", title);
+    }
+
+    [Fact]
+    public async Task PushSessionLink_BranchHasIssueOnly_RendersOpenIssue_AndOpenClaude()
+    {
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(prNumber: null, issueNumber: 16119), "Test subject",
+            TriageVerdict.Actionable("ok", summary: "Investigate"), default);
+
+        var json = ParseBody(_handler.Calls[0].Body);
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+
+        Assert.Equal(2, actions.Count);
+        Assert.Equal("Open Issue", actions[0].GetProperty("label").GetString());
+        Assert.Equal("https://github.com/ownerrez/orez/issues/16119", actions[0].GetProperty("url").GetString());
+        Assert.Equal("Open Claude", actions[1].GetProperty("label").GetString());
+        Assert.Equal("https://claude.ai/code/session_01ABC", actions[1].GetProperty("url").GetString());
+
+        // No click target — we deliberately omit it so the ntfy app doesn't render the
+        // auto COPY LINK / OPEN LINK buttons alongside our custom actions.
+        Assert.False(json.TryGetProperty("click", out var click) && click.ValueKind != JsonValueKind.Null,
+            "click should be absent so ntfy doesn't auto-render extra buttons");
+    }
+
+    [Fact]
+    public async Task PushSessionLink_BranchHasPrOnly_RendersOpenPr_AndOpenClaude()
+    {
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(prNumber: 16742, issueNumber: null), "Test subject",
+            TriageVerdict.Actionable("ok", summary: "Address review"), default);
+
+        var json = ParseBody(_handler.Calls[0].Body);
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+
+        Assert.Equal(2, actions.Count);
+        Assert.Equal("Open PR", actions[0].GetProperty("label").GetString());
+        Assert.Equal("https://github.com/ownerrez/orez/pull/16742", actions[0].GetProperty("url").GetString());
+        Assert.Equal("Open Claude", actions[1].GetProperty("label").GetString());
+    }
+
+    [Fact]
+    public async Task PushSessionLink_BranchHasBothPrAndIssue_RendersAllThreeButtons()
+    {
+        // Cross-linked PR-and-issue branches surface both buttons; ntfy supports up to 3
+        // custom view actions per notification — exactly enough for our layout.
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(prNumber: 16742, issueNumber: 16119), "Test subject",
+            TriageVerdict.Actionable("ok", summary: "Both"), default);
+
+        var json = ParseBody(_handler.Calls[0].Body);
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+
+        Assert.Equal(3, actions.Count);
+        Assert.Equal("Open PR", actions[0].GetProperty("label").GetString());
+        Assert.Equal("Open Issue", actions[1].GetProperty("label").GetString());
+        Assert.Equal("Open Claude", actions[2].GetProperty("label").GetString());
+
+        Assert.Equal("https://github.com/ownerrez/orez/pull/16742",
+            actions[0].GetProperty("url").GetString());
+        Assert.Equal("https://github.com/ownerrez/orez/issues/16119",
+            actions[1].GetProperty("url").GetString());
+        Assert.Equal("https://claude.ai/code/session_01ABC",
+            actions[2].GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public async Task PushSessionLink_NoPrNoIssue_StillRendersOpenClaude()
+    {
+        // Branch resolved with neither PR nor issue (rare — orphan branch). At minimum the
+        // Open Claude button always renders so the user has a tap target.
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(prNumber: null, issueNumber: null), "Test subject",
+            TriageVerdict.Actionable("ok"), default);
+
+        var json = ParseBody(_handler.Calls[0].Body);
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+
+        Assert.Single(actions);
+        Assert.Equal("Open Claude", actions[0].GetProperty("label").GetString());
+        Assert.Equal("https://claude.ai/code/session_01ABC", actions[0].GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public async Task PushHeadsUp_UsesNormalPriority_SameTitleAndButtonShape()
+    {
+        // No prefix on title — priority alone distinguishes session-link from heads-up on
+        // the phone (PriorityHigh pings, PriorityNormal is silent).
         await Build().PushHeadsUpAsync(
-            "http://172.16.5.10:1234", Branch(), Notification("DP multiplier wrong on virtual"),
+            "https://claude.ai/code/session_01ABC", Branch(prNumber: 16742, issueNumber: 16119),
+            "DP multiplier wrong on virtual properties",
             TriageVerdict.Actionable("followup", summary: "Investigate DP fix"),
             default);
 
         var json = ParseBody(_handler.Calls[0].Body);
         Assert.Equal(3, json.GetProperty("priority").GetInt32());
-        Assert.StartsWith("[update] [ownerrez/orez:16119-isdpvirtualproperty]",
-            json.GetProperty("title").GetString());
-        Assert.Equal("Resume session",
-            json.GetProperty("actions")[0].GetProperty("label").GetString());
+        Assert.Equal("DP multiplier wrong on virtual properties", json.GetProperty("title").GetString());
+
+        // Same 3-button layout as session-link — heads-up only differs on priority.
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+        Assert.Equal(3, actions.Count);
     }
 
     [Fact]
-    public async Task PushSessionLink_NotAvailableUrl_OmitsClickAndActions_ShowsStatusInBody()
+    public async Task PushSessionLink_NotAvailableUrl_OpenClaudeFallsBackToClaudeHome_BodyShowsNotAvailable()
     {
-        // The dispatcher passes "Not Available" as the URL when the RC relay is down. We
-        // still want the push to fire (so the user sees an actionable thing arrived), just
-        // without a click/action that would open nowhere.
+        // Dispatcher passes "Not Available" when RC spawn fails. Open Claude button still
+        // renders (better than no button at all) but points at claude.ai/code as a fallback.
+        // Body's Session line shows "Not Available" so the user knows before tapping.
         await Build().PushSessionLinkAsync(
-            "Not Available", Branch(), Notification("Bug in DP multiplier"),
-            TriageVerdict.Actionable("question on virtual properties", summary: "Investigate DP fix"),
+            "Not Available", Branch(prNumber: null, issueNumber: 16119), "Test subject",
+            TriageVerdict.Actionable("question", summary: "Investigate DP fix"),
             default);
 
         var json = ParseBody(_handler.Calls[0].Body);
 
-        // Same priority and title as a normal session-link push — there's no separate prefix.
-        Assert.Equal(4, json.GetProperty("priority").GetInt32());
-        Assert.StartsWith("[ownerrez/orez:16119-isdpvirtualproperty]",
-            json.GetProperty("title").GetString());
-
-        Assert.False(json.TryGetProperty("click", out var click) && click.ValueKind != JsonValueKind.Null,
-            "click should be absent when URL is the literal \"Not Available\"");
-        Assert.False(json.TryGetProperty("actions", out var actions) && actions.ValueKind != JsonValueKind.Null,
-            "actions should be absent when URL is the literal \"Not Available\"");
-
-        // Body shows the status so the user knows why there's no tappable button.
         var body = json.GetProperty("message").GetString()!;
-        Assert.Contains("Session: Not Available", body);
-        // Subject + verdict.Why still there for context.
-        Assert.Contains("Bug in DP multiplier", body);
-        Assert.Contains("question on virtual properties", body);
+        // Italic styling on the "Not Available" line so it reads as a sub-status note.
+        Assert.Contains("_Session Not Available_", body);
+
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+        Assert.Equal(2, actions.Count);
+        Assert.Equal("Open Issue", actions[0].GetProperty("label").GetString());
+        Assert.Equal("Open Claude", actions[1].GetProperty("label").GetString());
+        Assert.Equal("https://claude.ai/code", actions[1].GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public async Task PushSessionLink_VerdictWithoutSummary_BodyIsJustMarkdownBranch()
+    {
+        // L1/L2 verdicts (e.g. "review_requested" shortcut) have no summary; body should
+        // collapse to just the markdown branch line — no Session line either, since the
+        // Open Claude button covers the URL.
+        await Build().PushSessionLinkAsync(
+            "https://claude.ai/code/session_01ABC", Branch(), "Test subject",
+            TriageVerdict.Actionable("review_requested"), default);
+
+        var body = ParseBody(_handler.Calls[0].Body).GetProperty("message").GetString()!;
+        Assert.Equal("`ownerrez/orez:16119-isdpvirtualproperty`", body);
     }
 
     [Fact]
@@ -143,26 +242,9 @@ public class NtfyPusherTests
         _options.Ntfy.Topic = "";
 
         await Build().PushSessionLinkAsync(
-            "http://172.16.5.10:1234", Branch(), Notification(),
-            TriageVerdict.Actionable("anything"), default);
+            "http://172.16.5.10:1234", Branch(), "Test subject", TriageVerdict.Actionable("anything"), default);
 
         Assert.Empty(_handler.Calls);
-    }
-
-    [Fact]
-    public async Task EmptyClickUrl_OmitsClickAndActions()
-    {
-        // RC server down (the Phase-5 smoke-test scenario) — push should still go out so the
-        // user sees there's a notification, just without a tappable URL.
-        await Build().PushSessionLinkAsync(
-            "", Branch(), Notification("RC down today"),
-            TriageVerdict.Actionable("hand-driven"), default);
-
-        var json = ParseBody(_handler.Calls[0].Body);
-        Assert.False(json.TryGetProperty("click", out var click) && click.ValueKind != JsonValueKind.Null,
-            "click should be absent or null when no RC URL is available");
-        Assert.False(json.TryGetProperty("actions", out var actions) && actions.ValueKind != JsonValueKind.Null,
-            "actions should be absent or null when no RC URL is available");
     }
 
     [Fact]
@@ -173,10 +255,8 @@ public class NtfyPusherTests
             Content = new StringContent("invalid topic"),
         };
 
-        // Should not throw — push is best-effort.
         await Build().PushSessionLinkAsync(
-            "http://172.16.5.10:1234", Branch(), Notification(),
-            TriageVerdict.Actionable("anything"), default);
+            "http://172.16.5.10:1234", Branch(), "Test subject", TriageVerdict.Actionable("anything"), default);
 
         Assert.Single(_handler.Calls);
     }
@@ -189,8 +269,7 @@ public class NtfyPusherTests
         _handler.Throw = new HttpRequestException("connection refused");
 
         await Build().PushSessionLinkAsync(
-            "http://172.16.5.10:1234", Branch(), Notification(),
-            TriageVerdict.Actionable("anything"), default);
+            "http://172.16.5.10:1234", Branch(), "Test subject", TriageVerdict.Actionable("anything"), default);
 
         // No assertion failure means no exception escaped.
     }
@@ -203,33 +282,18 @@ public class NtfyPusherTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             Build().PushSessionLinkAsync(
-                "http://172.16.5.10:1234", Branch(), Notification(),
-                TriageVerdict.Actionable("anything"), default));
+                "http://172.16.5.10:1234", Branch(), "Test subject", TriageVerdict.Actionable("anything"), default));
     }
 
     [Fact]
-    public async Task Title_TruncatesAt120Chars_PreservesPrefix()
-    {
-        // Real branch slugs can run long; a 200-char summary shouldn't push the [repo:branch]
-        // prefix off the visible title row on iOS.
-        var longSummary = new string('x', 200);
-        await Build().PushSessionLinkAsync(
-            "http://x", Branch(), Notification(),
-            TriageVerdict.Actionable("why", summary: longSummary), default);
-
-        var title = ParseBody(_handler.Calls[0].Body).GetProperty("title").GetString()!;
-        Assert.True(title.Length <= 121, $"expected truncated title, got {title.Length} chars");
-        Assert.StartsWith("[ownerrez/orez:16119-isdpvirtualproperty]", title);
-    }
-
-    [Fact]
-    public async Task UnicodeInTitle_GoesThroughUtf8Json_NotMojibake()
+    public async Task UnicodeInSummary_GoesThroughUtf8Json_NotMojibake()
     {
         // Header-form ntfy would need RFC 2047 encoding; JSON form preserves UTF-8 directly.
         // Pin that we picked the JSON path so emoji + smart quotes round-trip.
         await Build().PushSessionLinkAsync(
-            "http://x", Branch(), Notification("Thanks 🎉 for the “fix”"),
-            TriageVerdict.Actionable("ok"), default);
+            "https://claude.ai/code/session_01ABC", Branch(), "Test subject",
+            TriageVerdict.Actionable("ok", summary: "Thanks 🎉 for the “fix”"),
+            default);
 
         var msg = ParseBody(_handler.Calls[0].Body).GetProperty("message").GetString();
         Assert.Contains("🎉", msg);
