@@ -34,6 +34,14 @@ public interface IGhClient
 
     Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Returns the PR number of the single open PR whose head ref equals
+    /// <paramref name="branch"/>, or <c>null</c> if there are zero or more than one.
+    /// Used by <see cref="IBranchResolver"/> to cross-link an issue notification to its
+    /// associated PR (the common case is one issue → one PR named after the issue).
+    /// </summary>
+    Task<int?> FindOpenPrNumberForBranchAsync(string repoFullName, string branch, CancellationToken cancellationToken);
+
     /// <summary>Lightweight auth probe: <c>gh api /user</c>. Throws on failure.</summary>
     Task<string> WhoAmIAsync(CancellationToken cancellationToken);
 }

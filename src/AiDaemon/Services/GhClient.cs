@@ -76,6 +76,38 @@ public class GhClient : IGhClient
     public Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken)
         => ApiAsync<PrInfo>($"/repos/{repoFullName}/pulls/{prNumber}", cancellationToken);
 
+    public async Task<int?> FindOpenPrNumberForBranchAsync(
+        string repoFullName, string branch, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(repoFullName) || string.IsNullOrWhiteSpace(branch))
+            return null;
+
+        var slash = repoFullName.IndexOf('/');
+        if (slash <= 0 || slash == repoFullName.Length - 1)
+            return null;
+        var owner = repoFullName[..slash];
+
+        // GitHub's pulls list endpoint accepts head=<owner>:<branch>. Fork PRs would be
+        // owner=<forker>; we only care about same-repo PRs since that's the worktree case
+        // the daemon supports.
+        var path = $"/repos/{repoFullName}/pulls?state=open&head={Uri.EscapeDataString($"{owner}:{branch}")}";
+
+        List<PrInfo> prs;
+        try
+        {
+            prs = await ApiAsync<List<PrInfo>>(path, cancellationToken);
+        }
+        catch (GhCliException ex) when (ex.Stderr.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // "The common case" — exactly one open PR for the branch. Zero (issue-only branch)
+        // or more than one (rare; conflicting reopens) → return null and let the caller
+        // omit the Open PR button rather than guess.
+        return prs.Count == 1 ? prs[0].Number : null;
+    }
+
     public async Task<string> WhoAmIAsync(CancellationToken cancellationToken)
     {
         var doc = await ApiAsync<JsonElement>("/user", cancellationToken);

@@ -119,7 +119,14 @@ public class BranchResolver : IBranchResolver
         if (!await ConfirmWorktreeOnBranchAsync(worktree, branch, n.Id, cancellationToken))
             return null;
 
-        return new BranchInfo(n.Repository.FullName, branch, worktree, PrNumber: prNumber, IssueNumber: null);
+        // Cross-link to the linked issue: branch convention is "<issue>-<slug>", so the
+        // numeric prefix of head.ref is the issue number in the common case. No network
+        // call — purely string parsing.
+        int? linkedIssue = null;
+        if (LeadingNumericPrefix(branch) is string p && int.TryParse(p, out var issueFromBranch))
+            linkedIssue = issueFromBranch;
+
+        return new BranchInfo(n.Repository.FullName, branch, worktree, PrNumber: prNumber, IssueNumber: linkedIssue);
     }
 
     async Task<BranchInfo?> ResolveIssueAsync(GhNotification n, int issueNumber, CancellationToken cancellationToken)
@@ -140,7 +147,22 @@ public class BranchResolver : IBranchResolver
             return null;
         }
 
-        return new BranchInfo(n.Repository.FullName, branch, worktree, PrNumber: null, IssueNumber: issueNumber);
+        // Cross-link to the open PR for this branch (if there's exactly one). Costs one
+        // gh api call but lets the push surface both Open Issue + Open PR buttons in the
+        // common one-issue/one-PR case. Failure to find a PR is fine — we drop the button.
+        int? linkedPr = null;
+        try
+        {
+            linkedPr = await _gh.FindOpenPrNumberForBranchAsync(n.Repository.FullName, branch, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex,
+                "PR cross-link lookup failed for branch={Branch} thread={ThreadId} — proceeding without Open PR button",
+                branch, n.Id);
+        }
+
+        return new BranchInfo(n.Repository.FullName, branch, worktree, PrNumber: linkedPr, IssueNumber: issueNumber);
     }
 
     /// <summary>

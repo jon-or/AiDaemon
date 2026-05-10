@@ -141,6 +141,59 @@ public class GhClientTests
         Assert.DoesNotContain("since=", calls[0][2]);
     }
 
+    // ---------- FindOpenPrNumberForBranchAsync ----------
+
+    [Fact]
+    public async Task FindOpenPrForBranch_ReturnsNumber_WhenExactlyOneOpenPr()
+    {
+        CaptureGhArgs(out var calls,
+            stdout: """[{"number":16742,"head":{"ref":"16119-isdpvirtualproperty","sha":"x"},"base":{"ref":"master","sha":"y"}}]""");
+
+        var got = await Build().FindOpenPrNumberForBranchAsync(
+            "ownerrez/orez", "16119-isdpvirtualproperty", default);
+
+        Assert.Equal(16742, got);
+        Assert.Single(calls);
+        // Path shape: /repos/<owner>/<repo>/pulls?state=open&head=<owner>:<branch>
+        Assert.StartsWith("/repos/ownerrez/orez/pulls?", calls[0][1]);
+        Assert.Contains("state=open", calls[0][1]);
+        Assert.Contains("head=ownerrez%3A16119-isdpvirtualproperty", calls[0][1]);
+    }
+
+    [Fact]
+    public async Task FindOpenPrForBranch_ReturnsNull_WhenZeroOpenPrs()
+    {
+        StubGh("[]");
+        var got = await Build().FindOpenPrNumberForBranchAsync(
+            "ownerrez/orez", "16119-isdpvirtualproperty", default);
+        Assert.Null(got);
+    }
+
+    [Fact]
+    public async Task FindOpenPrForBranch_ReturnsNull_WhenMultipleOpenPrs()
+    {
+        // Rare but possible (conflicting reopens, broken state). Don't guess — drop the
+        // Open PR button rather than pick wrong.
+        StubGh("""[{"number":16742,"head":{"ref":"16119-isdpvirtualproperty","sha":"x"},"base":{"ref":"master","sha":"y"}},{"number":16800,"head":{"ref":"16119-isdpvirtualproperty","sha":"z"},"base":{"ref":"master","sha":"y"}}]""");
+
+        var got = await Build().FindOpenPrNumberForBranchAsync(
+            "ownerrez/orez", "16119-isdpvirtualproperty", default);
+        Assert.Null(got);
+    }
+
+    [Theory]
+    [InlineData("", "16119-foo")]
+    [InlineData("ownerrez/orez", "")]
+    [InlineData("malformed-no-slash", "16119-foo")]
+    [InlineData("trailing-slash/", "16119-foo")]
+    public async Task FindOpenPrForBranch_BadInputs_ReturnNull_NoGhCall(string repo, string branch)
+    {
+        // Strict-mode runner means an unstubbed gh call would throw.
+        var got = await Build().FindOpenPrNumberForBranchAsync(repo, branch, default);
+        Assert.Null(got);
+        _runner.VerifyNoOtherCalls();
+    }
+
     // ---------- WhoAmIAsync ----------
 
     [Fact]

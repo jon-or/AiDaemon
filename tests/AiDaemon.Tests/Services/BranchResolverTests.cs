@@ -96,6 +96,7 @@ public class BranchResolverTests
         _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
             .Returns(new[] { worktree });
         StubGitBranch(worktree, "16119-isdpvirtualproperty");
+        // No PR cross-link in this scenario (FindOpenPrNumberForBranchAsync returns null).
 
         var got = await Build().ResolveAsync(IssueN(16119), default);
 
@@ -106,6 +107,49 @@ public class BranchResolverTests
         Assert.Equal(16119, got.IssueNumber);
         Assert.Null(got.PrNumber);
         Assert.Equal("ownerrez/orez:16119-isdpvirtualproperty", got.Key);
+    }
+
+    [Fact]
+    public async Task Issue_CrossLinksOpenPr_WhenExactlyOneFound()
+    {
+        // Common case: an issue that has a single open PR named after it (e.g. branch
+        // "16119-isdpvirtualproperty" → PR #16742). The resolver should populate both
+        // PrNumber and IssueNumber so the push surfaces both Open PR + Open Issue buttons.
+        var worktree = @"C:\Users\Jon\worktrees\16119-isdpvirtualproperty";
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(new[] { worktree });
+        StubGitBranch(worktree, "16119-isdpvirtualproperty");
+        _gh.Setup(g => g.FindOpenPrNumberForBranchAsync(
+                "ownerrez/orez", "16119-isdpvirtualproperty", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(16742);
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+
+        Assert.NotNull(got);
+        Assert.Equal(16119, got!.IssueNumber);
+        Assert.Equal(16742, got.PrNumber);
+    }
+
+    [Fact]
+    public async Task Issue_NoCrossLink_WhenGhLookupThrows()
+    {
+        // gh transient failure — the issue resolution itself is fine; we just drop the
+        // Open PR button rather than failing the dispatch.
+        var worktree = @"C:\Users\Jon\worktrees\16119-isdpvirtualproperty";
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(new[] { worktree });
+        StubGitBranch(worktree, "16119-isdpvirtualproperty");
+        _gh.Setup(g => g.FindOpenPrNumberForBranchAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhCliException(1, "transient", "transient"));
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+
+        Assert.NotNull(got);
+        Assert.Equal(16119, got!.IssueNumber);
+        Assert.Null(got.PrNumber);
     }
 
     [Fact]
@@ -189,6 +233,32 @@ public class BranchResolverTests
         Assert.Equal(16773, got!.PrNumber);
         Assert.Equal("16119-isdpvirtualproperty", got.Branch);
         Assert.Equal(worktree, got.Worktree);
+        // Cross-link to the issue derived from the branch's numeric prefix — no network
+        // call, just string parsing on "<issue>-<slug>".
+        Assert.Equal(16119, got.IssueNumber);
+    }
+
+    [Fact]
+    public async Task Pr_NoIssueCrossLink_WhenBranchHasNoNumericPrefix()
+    {
+        // Branch doesn't follow the "<issue>-<slug>" convention (e.g. "feature/foo") —
+        // we can't derive an issue, so leave IssueNumber null.
+        var worktree = @"C:\Users\Jon\worktrees\feature-foo";
+
+        _gh.Setup(g => g.GetPullRequestAsync("ownerrez/orez", 16773, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PrInfo
+            {
+                Number = 16773,
+                Head = new PrRef { Ref = "feature-foo", Sha = "x" },
+            });
+        _fs.Setup(f => f.DirectoryExists(worktree)).Returns(true);
+        StubGitBranch(worktree, "feature-foo");
+
+        var got = await Build().ResolveAsync(PrN(16773), default);
+
+        Assert.NotNull(got);
+        Assert.Equal(16773, got!.PrNumber);
+        Assert.Null(got.IssueNumber);
     }
 
     [Fact]
