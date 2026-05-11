@@ -109,10 +109,20 @@ public class BranchResolver : IBranchResolver
 
             if (!_fs.DirectoryExists(worktree))
             {
-                _logger.LogInformation(
-                    "no worktree for PR {Repo}#{Pr} branch={Branch} (looked under {WorktreeRoot})",
-                    n.Repository.FullName, prNumber, branch, _options.WorktreeRoot);
-                return null;
+                // Nothing on disk — attempt to materialize the worktree from a local ref.
+                // Silently skips if no RepoRoots entry, or if the branch isn't a local ref
+                // (cross-fork PRs, unfetched refs). That's by design — the human can fetch
+                // + retry on the next poll.
+                var created = await TryCreateWorktreeAsync(
+                    n.Repository.FullName, branch, cancellationToken);
+                if (created == null)
+                {
+                    _logger.LogInformation(
+                        "no worktree for PR {Repo}#{Pr} branch={Branch} and auto-create skipped (looked under {WorktreeRoot})",
+                        n.Repository.FullName, prNumber, branch, _options.WorktreeRoot);
+                    return null;
+                }
+                worktree = created;
             }
         }
 
@@ -134,10 +144,17 @@ public class BranchResolver : IBranchResolver
         var worktree = FindWorktreeByPrefix(issueNumber.ToString());
         if (worktree == null)
         {
-            _logger.LogInformation(
-                "no worktree for issue {Repo}#{Issue} (looked under {WorktreeRoot}\\{Issue}-*)",
-                n.Repository.FullName, issueNumber, _options.WorktreeRoot, issueNumber);
-            return null;
+            // No worktree on disk — try to materialize one from a matching local branch.
+            // Convention: branches are "<issue>-<slug>", so a single ref matching
+            // refs/heads/<issue>-* is unambiguous. Zero or multiple matches → silent skip.
+            worktree = await TryCreateWorktreeForIssueAsync(n, issueNumber, cancellationToken);
+            if (worktree == null)
+            {
+                _logger.LogInformation(
+                    "no worktree for issue {Repo}#{Issue} and auto-create skipped (looked under {WorktreeRoot}\\{Issue}-*)",
+                    n.Repository.FullName, issueNumber, _options.WorktreeRoot, issueNumber);
+                return null;
+            }
         }
 
         var branch = await ReadCurrentBranchAsync(worktree, cancellationToken);
@@ -221,6 +238,157 @@ public class BranchResolver : IBranchResolver
                 worktree, GitTimeout.TotalSeconds);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Shells <c>git -C &lt;repoRoot&gt; worktree add &lt;WorktreeRoot&gt;\&lt;branch&gt; &lt;branch&gt;</c>.
+    /// Returns the new worktree path on success, or null when:
+    /// <list type="bullet">
+    ///   <item><see cref="DaemonOptions.RepoRoots"/> has no entry for the repo.</item>
+    ///   <item>The configured repo root doesn't exist on disk.</item>
+    ///   <item>git exits non-zero (most commonly: the branch is not a local ref).</item>
+    /// </list>
+    /// Failure is logged at Information — silent enough to be a normal "branch not local yet"
+    /// skip on every poll, loud enough to spot a misconfigured RepoRoots entry in the log.
+    /// </summary>
+    async Task<string?> TryCreateWorktreeAsync(string repo, string branch, CancellationToken cancellationToken)
+    {
+        if (!_options.RepoRoots.TryGetValue(repo, out var repoRoot) || string.IsNullOrWhiteSpace(repoRoot))
+        {
+            _logger.LogDebug(
+                "no RepoRoots entry for {Repo} — skipping worktree auto-create for branch {Branch}",
+                repo, branch);
+            return null;
+        }
+
+        if (!_fs.DirectoryExists(repoRoot))
+        {
+            _logger.LogWarning(
+                "RepoRoots[{Repo}] points at {RepoRoot} which does not exist — skipping auto-create for {Branch}",
+                repo, repoRoot, branch);
+            return null;
+        }
+
+        var worktree = Path.Combine(_options.WorktreeRoot, branch);
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(GitTimeout);
+
+        ProcessResult result;
+        try
+        {
+            result = await _runner.RunAsync(
+                "git",
+                new[] { "-C", repoRoot, "worktree", "add", worktree, branch },
+                cancellationToken: cts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "git worktree add for {Repo}:{Branch} did not return within {Timeout}s — skipping",
+                repo, branch, GitTimeout.TotalSeconds);
+            return null;
+        }
+
+        if (!result.Succeeded)
+        {
+            // Most common reason: branch isn't a local ref (fork PR, or user hasn't fetched
+            // recently). Per design, silently skip — they can fetch + retry on next poll.
+            _logger.LogInformation(
+                "git worktree add failed for {Repo}:{Branch} (exit={Exit}): {Stderr}",
+                repo, branch, result.ExitCode, result.Stderr.TrimEnd());
+            return null;
+        }
+
+        _logger.LogInformation(
+            "auto-created worktree {Worktree} for {Repo}:{Branch}", worktree, repo, branch);
+        return worktree;
+    }
+
+    /// <summary>
+    /// Issue notifications don't carry a branch — we infer one from the local ref namespace.
+    /// Lists <c>refs/heads/&lt;issue&gt;-*</c> in the configured repo root; only an unambiguous
+    /// single match feeds into <see cref="TryCreateWorktreeAsync"/>. Zero matches → branch
+    /// hasn't been created yet (the user's workflow hasn't reached that issue). Multiple
+    /// matches → ambiguous; we don't pick.
+    /// </summary>
+    async Task<string?> TryCreateWorktreeForIssueAsync(GhNotification n, int issueNumber, CancellationToken cancellationToken)
+    {
+        if (!_options.RepoRoots.TryGetValue(n.Repository.FullName, out var repoRoot) || string.IsNullOrWhiteSpace(repoRoot))
+        {
+            _logger.LogDebug(
+                "no RepoRoots entry for {Repo} — skipping issue auto-create for #{Issue}",
+                n.Repository.FullName, issueNumber);
+            return null;
+        }
+
+        if (!_fs.DirectoryExists(repoRoot))
+        {
+            _logger.LogWarning(
+                "RepoRoots[{Repo}] points at {RepoRoot} which does not exist — skipping auto-create for issue #{Issue}",
+                n.Repository.FullName, repoRoot, issueNumber);
+            return null;
+        }
+
+        var branch = await FindLocalBranchForIssueAsync(repoRoot, issueNumber, cancellationToken);
+        if (branch == null)
+            return null;
+
+        return await TryCreateWorktreeAsync(n.Repository.FullName, branch, cancellationToken);
+    }
+
+    async Task<string?> FindLocalBranchForIssueAsync(string repoRoot, int issueNumber, CancellationToken cancellationToken)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(GitTimeout);
+
+        ProcessResult result;
+        try
+        {
+            result = await _runner.RunAsync(
+                "git",
+                new[]
+                {
+                    "-C", repoRoot, "for-each-ref",
+                    "--format=%(refname:short)",
+                    $"refs/heads/{issueNumber}-*",
+                },
+                cancellationToken: cts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "git for-each-ref for issue {Issue} did not return within {Timeout}s",
+                issueNumber, GitTimeout.TotalSeconds);
+            return null;
+        }
+
+        if (!result.Succeeded)
+        {
+            _logger.LogWarning(
+                "git for-each-ref refs/heads/{Issue}-* failed (exit={Exit}): {Stderr}",
+                issueNumber, result.ExitCode, result.Stderr.TrimEnd());
+            return null;
+        }
+
+        var matches = result.Stdout
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => s.Trim())
+            .Where(s => s.Length > 0)
+            .ToList();
+
+        if (matches.Count == 0)
+            return null;
+
+        if (matches.Count > 1)
+        {
+            _logger.LogInformation(
+                "issue #{Issue} matches multiple local branches ({Branches}) — skipping auto-create",
+                issueNumber, string.Join(", ", matches));
+            return null;
+        }
+
+        return matches[0];
     }
 
     string? FindWorktreeByPrefix(string numericPrefix)

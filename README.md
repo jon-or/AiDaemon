@@ -24,12 +24,15 @@ Before the first run, fill in `src\AiDaemon\appsettings.Local.json` with at leas
     "AiUserLogin": "jon-or-ai",
     "WorktreeRoot": "D:\\git\\orez.worktrees",
     "RepoAllowlist": [ "ownerrez/orez" ],
+    "RepoRoots": { "ownerrez/orez": "D:\\git\\orez" },
     "Ntfy": { "Topic": "your-uuid-topic-name" }
   }
 }
 ```
 
 And confirm `gh auth status` reports the account matching `AiUserLogin` (run `gh auth login` if it doesn't — see [plan.md](plan.md) for the multi-account setup).
+
+`RepoRoots` maps each allowlisted repo to its main clone. When a notification arrives for a branch that has no matching worktree under `WorktreeRoot`, the daemon shells `git -C <RepoRoots[repo]> worktree add <WorktreeRoot>\<branch> <branch>` to materialize one. The branch must already exist as a local ref — cross-fork PRs and unfetched refs silently skip (re-run `git fetch` and the next poll will pick them up). For Issue notifications without a branch, the daemon looks up `refs/heads/<issue>-*` in the main clone and only auto-creates when there's exactly one unambiguous match. Omit `RepoRoots` (or an entry within it) to keep the legacy "skip if no worktree" behavior for that repo.
 
 ## Layout
 

@@ -67,6 +67,37 @@ public class BranchResolverTests
             .ReturnsAsync(new ProcessResult(exit, branch + "\n", ""));
     }
 
+    void StubGitWorktreeAdd(string repoRoot, string worktreePath, string branch, int exit = 0, string stderr = "")
+    {
+        _runner.Setup(r => r.RunAsync(
+                "git",
+                It.Is<IReadOnlyList<string>>(a =>
+                    a.Count == 6 && a[0] == "-C" && a[1] == repoRoot
+                    && a[2] == "worktree" && a[3] == "add"
+                    && a[4] == worktreePath && a[5] == branch),
+                It.IsAny<string?>(),
+                It.IsAny<IReadOnlyDictionary<string, string?>?>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ProcessResult(exit, "", stderr));
+    }
+
+    void StubGitForEachRef(string repoRoot, int issueNumber, string stdout, int exit = 0)
+    {
+        _runner.Setup(r => r.RunAsync(
+                "git",
+                It.Is<IReadOnlyList<string>>(a =>
+                    a.Count == 5 && a[0] == "-C" && a[1] == repoRoot
+                    && a[2] == "for-each-ref"
+                    && a[3] == "--format=%(refname:short)"
+                    && a[4] == $"refs/heads/{issueNumber}-*"),
+                It.IsAny<string?>(),
+                It.IsAny<IReadOnlyDictionary<string, string?>?>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ProcessResult(exit, stdout, ""));
+    }
+
     [Theory]
     [InlineData("https://api.github.com/repos/o/r/issues/123", 123)]
     [InlineData("https://api.github.com/repos/o/r/pulls/7", 7)]
@@ -385,5 +416,206 @@ public class BranchResolverTests
         _options.WorktreeRoot = "";
         var got = await Build().ResolveAsync(IssueN(16119), default);
         Assert.Null(got);
+    }
+
+    // ---- Auto-create behavior ----
+
+    const string RepoRoot = @"D:\git\orez";
+
+    void EnableAutoCreate() => _options.RepoRoots["ownerrez/orez"] = RepoRoot;
+
+    [Fact]
+    public async Task Pr_NoWorktree_AutoCreatesWhenBranchExistsLocally()
+    {
+        // PR with head.ref the user has fetched locally but never made a worktree for.
+        // Resolver should shell `git worktree add` and treat the new dir like any other.
+        EnableAutoCreate();
+        var branch = "16119-isdpvirtualproperty";
+        var worktree = Path.Combine(_options.WorktreeRoot, branch);
+
+        _gh.Setup(g => g.GetPullRequestAsync("ownerrez/orez", 16773, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PrInfo
+            {
+                Number = 16773,
+                Head = new PrRef { Ref = branch, Sha = "deadbeef" },
+            });
+
+        // Initial probes: neither exact-name dir nor any "16119-*" worktree exists.
+        _fs.Setup(f => f.DirectoryExists(worktree)).Returns(false);
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(Array.Empty<string>());
+        // RepoRoot must exist on disk before we shell git from there.
+        _fs.Setup(f => f.DirectoryExists(RepoRoot)).Returns(true);
+
+        StubGitWorktreeAdd(RepoRoot, worktree, branch);
+        StubGitBranch(worktree, branch);
+
+        var got = await Build().ResolveAsync(PrN(16773), default);
+
+        Assert.NotNull(got);
+        Assert.Equal(worktree, got!.Worktree);
+        Assert.Equal(branch, got.Branch);
+        Assert.Equal(16773, got.PrNumber);
+        Assert.Equal(16119, got.IssueNumber);
+    }
+
+    [Fact]
+    public async Task Pr_NoWorktree_SkipsSilentlyWhenBranchNotLocal()
+    {
+        // Fork PR or unfetched ref — `git worktree add` exits non-zero. Resolver should
+        // return null without raising (silent skip; the next poll will retry if the user
+        // fetches in the meantime).
+        EnableAutoCreate();
+        var branch = "feature/external-fork";
+        var worktree = Path.Combine(_options.WorktreeRoot, branch);
+
+        _gh.Setup(g => g.GetPullRequestAsync("ownerrez/orez", 9001, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PrInfo
+            {
+                Number = 9001,
+                Head = new PrRef { Ref = branch, Sha = "x" },
+            });
+        _fs.Setup(f => f.DirectoryExists(It.IsAny<string>())).Returns(false);
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.DirectoryExists(RepoRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(It.IsAny<string>(), It.IsAny<string>()))
+            .Returns(Array.Empty<string>());
+
+        StubGitWorktreeAdd(RepoRoot, worktree, branch,
+            exit: 128,
+            stderr: "fatal: invalid reference: feature/external-fork\n");
+
+        var got = await Build().ResolveAsync(PrN(9001), default);
+
+        Assert.Null(got);
+    }
+
+    [Fact]
+    public async Task Pr_NoWorktree_SkipsWhenRepoRootsNotConfigured()
+    {
+        // No RepoRoots entry for the repo → resolver preserves legacy "skip silently"
+        // behavior even when WorktreeRoot is otherwise present.
+        _gh.Setup(g => g.GetPullRequestAsync("ownerrez/orez", 16773, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PrInfo
+            {
+                Number = 16773,
+                Head = new PrRef { Ref = "16119-isdpvirtualproperty", Sha = "x" },
+            });
+        _fs.Setup(f => f.DirectoryExists(It.IsAny<string>())).Returns(false);
+
+        var got = await Build().ResolveAsync(PrN(16773), default);
+
+        Assert.Null(got);
+        // git should never have been invoked — auto-create is short-circuited by config.
+        _runner.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task Issue_NoWorktree_AutoCreatesWhenSingleLocalBranchMatches()
+    {
+        // No worktree for issue 16119, but exactly one local branch matches "16119-*" —
+        // unambiguous, so we materialize a worktree for it.
+        EnableAutoCreate();
+        var branch = "16119-isdpvirtualproperty";
+        var worktree = Path.Combine(_options.WorktreeRoot, branch);
+
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(Array.Empty<string>());
+        _fs.Setup(f => f.DirectoryExists(RepoRoot)).Returns(true);
+
+        StubGitForEachRef(RepoRoot, 16119, stdout: branch + "\n");
+        StubGitWorktreeAdd(RepoRoot, worktree, branch);
+        StubGitBranch(worktree, branch);
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+
+        Assert.NotNull(got);
+        Assert.Equal(worktree, got!.Worktree);
+        Assert.Equal(branch, got.Branch);
+        Assert.Equal(16119, got.IssueNumber);
+    }
+
+    [Fact]
+    public async Task Issue_NoWorktree_SkipsWhenNoLocalBranchMatches()
+    {
+        // for-each-ref returns empty — the user hasn't branched the issue yet. Skip silently.
+        EnableAutoCreate();
+
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "12345-*"))
+            .Returns(Array.Empty<string>());
+        _fs.Setup(f => f.DirectoryExists(RepoRoot)).Returns(true);
+
+        StubGitForEachRef(RepoRoot, 12345, stdout: "");
+
+        var got = await Build().ResolveAsync(IssueN(12345), default);
+
+        Assert.Null(got);
+    }
+
+    [Fact]
+    public async Task Issue_NoWorktree_SkipsWhenMultipleLocalBranchesMatch()
+    {
+        // Two stale branches with the same issue prefix → we don't guess. Skip silently.
+        EnableAutoCreate();
+
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(Array.Empty<string>());
+        _fs.Setup(f => f.DirectoryExists(RepoRoot)).Returns(true);
+
+        StubGitForEachRef(RepoRoot, 16119,
+            stdout: "16119-isdpvirtualproperty\n16119-old-attempt\n");
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+
+        Assert.Null(got);
+        // worktree add must not be invoked when the branch is ambiguous.
+        _runner.Verify(r => r.RunAsync(
+                "git",
+                It.Is<IReadOnlyList<string>>(a => a.Contains("worktree") && a.Contains("add")),
+                It.IsAny<string?>(),
+                It.IsAny<IReadOnlyDictionary<string, string?>?>(),
+                It.IsAny<string?>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Issue_NoWorktree_SkipsWhenRepoRootsNotConfigured()
+    {
+        // No RepoRoots entry → resolver doesn't even shell for-each-ref.
+        _fs.Setup(f => f.DirectoryExists(_options.WorktreeRoot)).Returns(true);
+        _fs.Setup(f => f.EnumerateDirectories(_options.WorktreeRoot, "16119-*"))
+            .Returns(Array.Empty<string>());
+
+        var got = await Build().ResolveAsync(IssueN(16119), default);
+
+        Assert.Null(got);
+        _runner.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task AutoCreate_SkipsWhenRepoRootDirectoryMissing()
+    {
+        // RepoRoots is configured but the path doesn't exist on disk (typo, dead drive).
+        // We warn (not asserted here — NullLogger swallows) and skip.
+        EnableAutoCreate();
+
+        _gh.Setup(g => g.GetPullRequestAsync("ownerrez/orez", 16773, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new PrInfo
+            {
+                Number = 16773,
+                Head = new PrRef { Ref = "16119-isdpvirtualproperty", Sha = "x" },
+            });
+        _fs.Setup(f => f.DirectoryExists(It.IsAny<string>())).Returns(false);
+
+        var got = await Build().ResolveAsync(PrN(16773), default);
+
+        Assert.Null(got);
+        // Never reached the for-each-ref / worktree-add subprocess.
+        _runner.VerifyNoOtherCalls();
     }
 }

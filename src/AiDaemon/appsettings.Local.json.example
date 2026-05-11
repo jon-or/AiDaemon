@@ -10,6 +10,12 @@
     "  Daemon.WorktreeRoot  Absolute path to the directory holding per-issue worktrees,",
     "                       named '<issue>-<slug>' (e.g. 16119-isdpvirtualproperty).",
     "  Daemon.RepoAllowlist GitHub repos the daemon may act on (others are skipped).",
+    "  Daemon.RepoRoots     Per-repo path to the main clone, keyed by 'owner/repo'. When a",
+    "                       notification arrives for a branch with no existing worktree, the",
+    "                       daemon shells `git -C <RepoRoots[repo]> worktree add` to create",
+    "                       one. The branch must already exist as a local ref — cross-fork",
+    "                       PRs and unfetched refs silently skip. Omit an entry to keep the",
+    "                       legacy 'skip if no worktree' behavior for that repo.",
     "  Daemon.Ntfy.Topic    Random UUID-like string. Anyone with the topic can read your",
     "                       pushes — keep it private."
   ],
@@ -18,6 +24,7 @@
     "AiUserLogin": "your-github-login",
     "WorktreeRoot": "C:\\Users\\you\\worktrees",
     "RepoAllowlist": [ "your-org/your-repo" ],
+    "RepoRoots": { "your-org/your-repo": "C:\\Users\\you\\src\\your-repo" },
     "Ntfy": {
       "Topic": "REPLACE-WITH-A-RANDOM-UUID-LIKE-STRING"
     }

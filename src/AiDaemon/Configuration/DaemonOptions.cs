@@ -13,6 +13,17 @@ public class DaemonOptions
     public string PowerShellPath { get; set; } = "powershell.exe";
     public string GhPath { get; set; } = "gh";
     public List<string> RepoAllowlist { get; set; } = new();
+
+    /// <summary>
+    /// Per-repo path to the main clone, keyed by <c>"owner/repo"</c>. When a notification
+    /// arrives for a branch with no existing worktree under <see cref="WorktreeRoot"/>, the
+    /// resolver shells <c>git -C &lt;RepoRoots[repo]&gt; worktree add &lt;WorktreeRoot&gt;\&lt;branch&gt;
+    /// &lt;branch&gt;</c> to materialize one. The branch must already exist locally — if it
+    /// doesn't (cross-fork PR, unfetched ref), the resolver silently skips the notification.
+    /// A repo with no entry here keeps the legacy behavior: skip notifications whose worktree
+    /// isn't already on disk.
+    /// </summary>
+    public Dictionary<string, string> RepoRoots { get; set; } = new();
     public List<string> ActionableReasons { get; set; } = new();
     public List<string> BotAuthorBlocklist { get; set; } = new();
     public int RcIdleTimeoutHours { get; set; } = 2;
