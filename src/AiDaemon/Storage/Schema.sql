@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS processed (
   comment_id      TEXT NOT NULL,
   processed_at    INTEGER NOT NULL,
   outcome         TEXT NOT NULL,
+  -- Display context captured at processing time so the tray Retry submenu can show
+  -- "repo/123 — Subject title" without re-fetching from GitHub. All three are
+  -- nullable so rows written before the schema migration still load cleanly.
+  repo            TEXT,
+  title           TEXT,
+  subject_type    TEXT,
   PRIMARY KEY (thread_id, comment_id)
 );
 

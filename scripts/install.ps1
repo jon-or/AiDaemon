@@ -1,59 +1,60 @@
 <#
 .SYNOPSIS
-    Installs AiDaemon as a Windows Service running under a named user account.
+    Installs AiDaemon as a per-user Scheduled Task that runs at logon.
 
 .DESCRIPTION
-    Runs `sc.exe create` with the exact argument syntax sc.exe demands (note the
-    mandatory space after every `=`) and configures crash auto-restart so a transient
-    failure doesn't take the daemon down for a whole day.
+    Why a Scheduled Task (not a Windows Service)?
+      * Services run in session 0, which is non-interactive since Vista.
+        AiDaemon spawns visible powershell + claude.exe console windows for
+        every Remote Control session; under a service those windows live on
+        a desktop nobody can see (and claude.exe can't read a real TTY there).
+      * A scheduled task triggered "At log on" runs inside the user's
+        interactive desktop session, so RC windows are visible and accept
+        keyboard input.
+      * "Run only when user is logged on" (LogonType Interactive) means we
+        never store the user's password -- the task uses the live interactive
+        token. No Get-Credential, no SeServiceLogonRight grant, no Error 1069.
 
-    Why a named user, not LocalSystem?
-      * %USERPROFILE% under LocalSystem resolves to C:\Windows\System32\config\systemprofile,
-        which breaks every `~/.claude/sessions/<PID>.json` read.
-      * WMI Win32_Process cross-session lookups for child claude.exe processes are reliable
-        only when the parent runs in the same desktop session.
-      * Claude's auth and trust state live under the user profile and are per-account.
+    Crash auto-restart: up to 3 retries at 1-minute intervals. Task Scheduler
+    refuses RestartInterval values below 1 minute, so we can't replicate the
+    old service's 5s/5s/30s ladder; for AiDaemon's "poll every N seconds"
+    cadence that's fine -- a 1-minute outage is still a single skipped tick.
 
 .PARAMETER BinDir
     Folder holding AiDaemon.exe and the appsettings files. Defaults to <repo>\publish.
-    For production prefer something like C:\Tools\AiDaemon.
+    For a stable install prefer something like C:\Tools\AiDaemon.
 
-.PARAMETER ServiceUser
-    Account the service runs as. Use ".\Jon" for a local account, "DOMAIN\Jon" for a
-    domain account. The account must have "Log on as a service" rights -- grant via
-    secpol.msc -> Local Policies -> User Rights Assignment, or
-    `ntrights -u <user> +r SeServiceLogonRight`.
+.PARAMETER TaskUser
+    Account the task runs as, qualified as "COMPUTERNAME\User" or "DOMAIN\User".
+    Defaults to the user invoking this script. Pass an explicit value only when
+    installing on behalf of someone else; that case requires elevation and the
+    target user must be logged on for the task to actually run.
 
-.PARAMETER ServiceName
+.PARAMETER TaskName
     Defaults to AiDaemon.
 
 .EXAMPLE
-    .\scripts\install.ps1 -BinDir C:\Tools\AiDaemon -ServiceUser .\Jon
-    # prompts for the password securely (Get-Credential)
+    .\scripts\install.ps1 -BinDir C:\Tools\AiDaemon
+    # registers the task for the current user; runs at next logon
 
 .NOTES
-    Must run elevated (sc.exe create needs Administrator).
+    Self-register for the current user does NOT require elevation. Registering
+    for a different -TaskUser does, and Register-ScheduledTask will surface a
+    clear access-denied if you try it from a non-elevated prompt.
 
-    This script is ASCII-only by design. Windows PowerShell 5.1 reads .ps1 files in the
-    OEM codepage unless a BOM is present, which mojibakes any non-ASCII character and
-    triggers a parser error. Don't introduce em-dashes / smart quotes / arrows here.
+    This script is ASCII-only by design. Windows PowerShell 5.1 reads .ps1
+    files in the OEM codepage unless a BOM is present, which mojibakes any
+    non-ASCII character and triggers a parser error. Don't introduce em-dashes
+    / smart quotes / arrows here.
 #>
 [CmdletBinding()]
 param(
     [string] $BinDir = (Join-Path $PSScriptRoot '..\publish'),
-    [Parameter(Mandatory = $true)]
-    [string] $ServiceUser,
-    [string] $ServiceName = 'AiDaemon'
+    [string] $TaskUser = "$env:USERDOMAIN\$env:USERNAME",
+    [string] $TaskName = 'AiDaemon'
 )
 
 $ErrorActionPreference = 'Stop'
-
-# Refuse to run non-elevated rather than letting sc.exe emit a cryptic "Access is denied".
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
-if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "install.ps1 must run elevated (Administrator)."
-}
 
 $BinDir = [System.IO.Path]::GetFullPath($BinDir)
 $exePath = Join-Path $BinDir 'AiDaemon.exe'
@@ -61,115 +62,63 @@ if (-not (Test-Path $exePath)) {
     throw "AiDaemon.exe not found at $exePath -- run .\scripts\publish.ps1 first."
 }
 
-# sc.exe obj= demands a qualified principal. ".\Jon", "COMPUTERNAME\Jon", "DOMAIN\Jon",
-# and "Jon@example.com" all work for sc.exe, but the Get-Credential dialog on Win10/11
-# with Microsoft-account sign-in REJECTS ".\Jon" (the tooltip says it only accepts
-# DOMAIN\user or user@domain). Use $env:COMPUTERNAME -- accepted by both surfaces.
-if ($ServiceUser -notmatch '[\\@]') {
-    $qualified = "$env:COMPUTERNAME\$ServiceUser"
-    Write-Host "ServiceUser '$ServiceUser' is unqualified -- using $qualified" -ForegroundColor Yellow
-    $ServiceUser = $qualified
-}
-elseif ($ServiceUser -like '.\*') {
-    # Local-prefix form works for sc.exe but Get-Credential rejects it on some SKUs.
-    # Rewrite to the computer-qualified form for consistent behaviour across surfaces.
-    $bare = $ServiceUser.Substring(2)
-    $qualified = "$env:COMPUTERNAME\$bare"
-    Write-Host "ServiceUser '$ServiceUser' rewritten to $qualified (Get-Credential rejects .\ shorthand)" -ForegroundColor Yellow
-    $ServiceUser = $qualified
+# Refuse to silently overwrite an existing registration -- operator should
+# explicitly uninstall first, matching the old install.ps1's contract.
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing) {
+    throw "Scheduled task '$TaskName' already exists. Run .\scripts\uninstall.ps1 first, then re-run this."
 }
 
-# Prompt for the service account password without echoing it.
-$cred = Get-Credential -UserName $ServiceUser -Message "Enter password for service account $ServiceUser"
-$plainPassword = $cred.GetNetworkCredential().Password
+Write-Host "Registering scheduled task '$TaskName'" -ForegroundColor Cyan
+Write-Host "  Action  : $exePath"
+Write-Host "  WorkDir : $BinDir"
+Write-Host "  Trigger : at logon of $TaskUser"
 
-# Refuse to silently overwrite an existing service -- operator should explicitly uninstall first.
-$existing = & sc.exe query $ServiceName 2>&1
-if ($LASTEXITCODE -eq 0) {
-    throw "Service '$ServiceName' already exists. Run .\scripts\uninstall.ps1 first, then re-run this."
-}
+$action = New-ScheduledTaskAction -Execute $exePath -WorkingDirectory $BinDir
 
-Write-Host "Installing service '$ServiceName' from $exePath running as $ServiceUser" -ForegroundColor Cyan
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $TaskUser
 
-# sc.exe requires a literal space after every `=` (e.g. "binPath= ..." not "binPath=..."),
-# so the option name and value have to be SEPARATE argv slots. Passing them as a single
-# array to Start-Process keeps PowerShell from collapsing the spaces and lets us
-# interpolate $exePath / $ServiceUser / $plainPassword without command echo leaking them.
-$createArgs = @(
-    'create', $ServiceName,
-    'binPath=', $exePath,
-    'start=', 'auto',
-    'obj=', $ServiceUser,
-    'password=', $plainPassword,
-    'DisplayName=', 'AiDaemon'
-)
-$proc = Start-Process -FilePath 'sc.exe' -ArgumentList $createArgs -NoNewWindow -Wait -PassThru
-if ($proc.ExitCode -ne 0) {
-    throw "sc.exe create failed with exit $($proc.ExitCode)"
-}
+# LogonType Interactive keeps the task in the user's desktop session so
+# spawned PowerShell + claude.exe windows are visible. S4U / Password /
+# ServiceAccount all suppress the interactive desktop and defeat the whole
+# reason we moved off the Windows Service. RunLevel Limited matches a normal
+# user logon -- the daemon never needs elevation.
+$principal = New-ScheduledTaskPrincipal -UserId $TaskUser -LogonType Interactive -RunLevel Limited
 
-Write-Host "Service created." -ForegroundColor Green
+# Settings notes:
+#   AllowStartIfOnBatteries / DontStopIfGoingOnBatteries: laptops can't have
+#     the daemon disappear when you unplug. Both flags are required -- the
+#     first allows initial start, the second keeps it running.
+#   StartWhenAvailable: if the logon trigger is missed (e.g. machine was off
+#     at the scheduled time, which doesn't apply to AtLogOn but is harmless),
+#     run it at next opportunity.
+#   RestartCount/RestartInterval: crash retry. 1-minute floor is enforced by
+#     Task Scheduler -- don't bother trying smaller.
+#   ExecutionTimeLimit (New-TimeSpan -Seconds 0): no time limit. Default is
+#     3 days, which would silently kill the daemon mid-week.
+#   MultipleInstances IgnoreNew: belt-and-braces against the AtLogOn trigger
+#     firing twice during Fast User Switching or session reconnect.
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+    -MultipleInstances IgnoreNew
 
-# Grant "Log on as a service" (SeServiceLogonRight). sc.exe is SUPPOSED to grant this
-# automatically when you pass password=, but it silently skips on some Win10/11 SKUs
-# (notably machines configured with Microsoft-account sign-in). Skipping the grant
-# means the service installs fine and then fails to start with the cryptic
-# "Error 1069: The service did not start due to a logon failure." -- which is
-# indistinguishable from a wrong password without further digging.
-#
-# Idempotent: secedit /configure merges the SID into the existing right list, so
-# re-running on a machine where the right is already present is a no-op.
-$bareUser = if ($ServiceUser -match '\\') { $ServiceUser.Split('\\')[-1] } else { $ServiceUser.Split('@')[0] }
-try {
-    $sid = (New-Object System.Security.Principal.NTAccount($bareUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-    Write-Host "Granting SeServiceLogonRight to $ServiceUser (SID $sid)..." -ForegroundColor Cyan
+Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger $trigger `
+    -Principal $principal `
+    -Settings $settings `
+    -Description 'Polls GitHub notifications scoped to the AI account, triages them, and spawns a Remote Control claude session per actionable event.' | Out-Null
 
-    $infFile = [IO.Path]::ChangeExtension([IO.Path]::GetTempFileName(), '.inf')
-    $sdbFile = [IO.Path]::ChangeExtension([IO.Path]::GetTempFileName(), '.sdb')
-    $infBody = @"
-[Unicode]
-Unicode=yes
-[Version]
-signature="`$CHICAGO`$"
-Revision=1
-[Privilege Rights]
-SeServiceLogonRight = *$sid
-"@
-    # secedit demands a UTF-16LE-with-BOM .inf or it silently produces "Task is completed"
-    # while doing nothing. PowerShell 5.1's -Encoding Unicode emits exactly that.
-    Set-Content -Path $infFile -Value $infBody -Encoding Unicode
-    $secedit = Start-Process -FilePath 'secedit.exe' `
-        -ArgumentList @('/configure', '/db', $sdbFile, '/cfg', $infFile, '/areas', 'USER_RIGHTS', '/quiet') `
-        -NoNewWindow -Wait -PassThru
-    Remove-Item $infFile, $sdbFile -Force -ErrorAction SilentlyContinue
-    if ($secedit.ExitCode -ne 0) {
-        Write-Warning "secedit returned exit $($secedit.ExitCode) -- if Start-Service fails with 1069, grant the right manually via secpol.msc."
-    } else {
-        Write-Host "SeServiceLogonRight granted." -ForegroundColor Green
-    }
-}
-catch {
-    Write-Warning "Could not resolve SID for '$bareUser': $($_.Exception.Message). If Start-Service fails with 1069, grant 'Log on as a service' manually via secpol.msc."
-}
-
-# Crash auto-restart: 5s, 5s, 30s, reset failure count after a successful 24h.
-Write-Host "Configuring failure actions (restart on crash)..." -ForegroundColor Cyan
-$failureArgs = @(
-    'failure', $ServiceName,
-    'reset=', '86400',
-    'actions=', 'restart/5000/restart/5000/restart/30000'
-)
-$proc = Start-Process -FilePath 'sc.exe' -ArgumentList $failureArgs -NoNewWindow -Wait -PassThru
-if ($proc.ExitCode -ne 0) {
-    Write-Warning "sc.exe failure returned exit $($proc.ExitCode) -- service is installed but auto-restart isn't configured."
-}
-
-# So `sc.exe qdescription AiDaemon 4096` shows operators what this is.
-& sc.exe description $ServiceName 'Polls GitHub notifications scoped to the AI account, triages them, and spawns a Remote Control claude session per actionable event.' | Out-Null
-
+Write-Host "Task registered." -ForegroundColor Green
 Write-Host ""
-Write-Host "Done. To start the service:" -ForegroundColor Green
-Write-Host "  Start-Service $ServiceName"
+Write-Host "To start the daemon now (without logging out and back in):" -ForegroundColor Green
+Write-Host "  Start-ScheduledTask -TaskName $TaskName"
 Write-Host ""
 Write-Host "Logs land under C:\ProgramData\AiDaemon\logs\ (or the DataDir configured in appsettings)." -ForegroundColor Yellow
 Write-Host "Pause without uninstalling: New-Item C:\ProgramData\AiDaemon\PAUSED -ItemType File"

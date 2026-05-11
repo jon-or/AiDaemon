@@ -319,7 +319,7 @@ public class Worker : BackgroundService
                 // table reflects what happened and an operator can see the trail in SQLite.
                 _logger.LogError(ex, "quick triage threw thread={ThreadId} — marking failed", n.Id);
                 failed++;
-                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"failed:quick-triage:{ex.GetType().Name}", cancellationToken);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"failed:quick-triage:{ex.GetType().Name}", ProcessedContext.From(n), cancellationToken);
                 continue;
             }
 
@@ -329,7 +329,7 @@ public class Worker : BackgroundService
                 _logger.LogInformation(
                     "verdict thread={ThreadId} action=Drop why={Why} (L1/L2)",
                     n.Id, quick.Why);
-                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"dropped:{quick.Why}", cancellationToken);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, $"dropped:{quick.Why}", ProcessedContext.From(n), cancellationToken);
                 continue;
             }
 
@@ -359,7 +359,7 @@ public class Worker : BackgroundService
 
             if (branch == null)
             {
-                await _stateStore.MarkProcessedAsync(n.Id, commentId, resolveOutcome ?? "unresolved", cancellationToken);
+                await _stateStore.MarkProcessedAsync(n.Id, commentId, resolveOutcome ?? "unresolved", ProcessedContext.From(n), cancellationToken);
                 continue;
             }
 
@@ -509,7 +509,7 @@ public class Worker : BackgroundService
         foreach (var item in batch.Items)
         {
             var commentId = NotificationPoller.DeriveCommentId(item.Notification);
-            await _stateStore.MarkProcessedAsync(item.Notification.Id, commentId, outcome, cancellationToken);
+            await _stateStore.MarkProcessedAsync(item.Notification.Id, commentId, outcome, ProcessedContext.From(item.Notification), cancellationToken);
         }
     }
 

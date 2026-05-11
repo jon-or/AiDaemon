@@ -94,7 +94,7 @@ public class NotificationPollerTests : IDisposable
     public async Task PollAsync_SkipsAlreadyProcessed()
     {
         var commentUrl = "https://api.github.com/repos/o/r/issues/comments/100";
-        await _store.MarkProcessedAsync("1", "100", "seen", default);
+        await _store.MarkProcessedAsync("1", "100", "seen", null, default);
 
         _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[] { N("1", commentUrl), N("2", null) });
@@ -125,7 +125,7 @@ public class NotificationPollerTests : IDisposable
     [Fact]
     public async Task PollAsync_WithSameThreadDifferentComment_YieldsAgain()
     {
-        await _store.MarkProcessedAsync("1", "100", "seen", default);
+        await _store.MarkProcessedAsync("1", "100", "seen", null, default);
 
         _gh.Setup(g => g.ListNotificationsAsync(It.IsAny<DateTimeOffset?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[]

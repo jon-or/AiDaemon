@@ -8,8 +8,8 @@
       appsettings.json              -- committed config
       appsettings.Local.json        -- local-only config (ntfy topic etc.); only if it exists
 
-    appsettings.Development.json is deliberately excluded from publish/ -- under the
-    Windows Service DOTNET_ENVIRONMENT is never set, so its 10s poll interval and Debug
+    appsettings.Development.json is deliberately excluded from publish/ -- the prod
+    scheduled task never sets DOTNET_ENVIRONMENT, so its 10s poll interval and Debug
     logging would never apply, and shipping it risks accidental dev settings on a prod box.
 
     Self-contained means the .NET 10 runtime is bundled, so the target machine doesn't
@@ -78,4 +78,4 @@ Get-ChildItem $OutDir -File | Format-Table Name, Length, LastWriteTime
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
 Write-Host "  1. (first install) .\scripts\install.ps1 -BinDir '$OutDir'"
-Write-Host "  2. (subsequent)    sc.exe stop AiDaemon; copy publish\* to install dir; sc.exe start AiDaemon"
+Write-Host "  2. (subsequent)    Stop-ScheduledTask AiDaemon; copy publish\* to install dir; Start-ScheduledTask AiDaemon"

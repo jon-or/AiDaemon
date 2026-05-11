@@ -1,6 +1,16 @@
 # AiDaemon
 
-A .NET 10 Windows Service that polls GitHub notifications scoped to an AI account, triages them with Claude, and spawns a Remote Control claude session per actionable event. The user drives every session — the daemon never edits, commits, or comments on its own.
+A .NET 10 background worker that polls GitHub notifications scoped to an AI account, triages them with Claude, and spawns a Remote Control claude session per actionable event. The user drives every session — the daemon never edits, commits, or comments on its own.
+
+Runs as a per-user **scheduled task** triggered at logon, not as a Windows Service: every RC session needs a visible PowerShell + claude.exe console window, and services live in session 0 (no interactive desktop). A scheduled task with `LogonType Interactive` runs inside the user's desktop session so RC windows are visible and accept keyboard input.
+
+The daemon also surfaces a **system-tray icon** while it's running — right-click for:
+
+- **Show today's log** — opens a tailing PowerShell window on `ai-daemon-<date>.log`
+- **Open log folder** — Explorer to the log directory
+- **Pause / Resume polling** — toggles the `PAUSED` flag file (no restart needed)
+- **Retry ►** — submenu of the 20 most-recently-processed notifications. Selecting one re-fetches the thread from GitHub via `/notifications/threads/{id}`, deletes the dedup row, and runs the same L1/L2/L3 + dispatch pipeline against it. Rate-limit budget is not charged for retries; outcome is surfaced as a balloon notification.
+- **Quit** — graceful host shutdown
 
 See [plan.md](plan.md) for the full design.
 
@@ -10,10 +20,10 @@ See [plan.md](plan.md) for the full design.
 # 1. Local dev — run from VS Code or the CLI
 dotnet run --project src\AiDaemon
 
-# 2. Production — publish + install as a Windows Service
+# 2. Production — publish + register the scheduled task
 .\scripts\publish.ps1
-.\scripts\install.ps1 -BinDir publish -ServiceUser .\Jon   # elevated; prompts for password
-Start-Service AiDaemon
+.\scripts\install.ps1 -BinDir publish              # registers for the current user, no password needed
+Start-ScheduledTask -TaskName AiDaemon             # or just log out and back in
 ```
 
 Before the first run, fill in `src\AiDaemon\appsettings.Local.json` with at least your ntfy topic (the file is gitignored):
@@ -52,7 +62,7 @@ And confirm `gh auth status` reports the account matching `AiUserLogin` (run `gh
 | Single-instance lock (also a PID dropbox) | `C:\ProgramData\AiDaemon\aidaemon.lock` |
 | Pause flag — daemon skips polling while it exists | `C:\ProgramData\AiDaemon\PAUSED` |
 | Per-worktree marker — never `claude --resume` against one of these | `<worktree>\.daemon-active` |
-| Service-account home (where `~/.claude` lives) | `C:\Users\<ServiceUser>\.claude\` |
+| Task-user home (where `~/.claude` lives) | `C:\Users\<TaskUser>\.claude\` |
 
 > All paths above assume the default `DataDir`. If you changed `DataDir` in `appsettings.json`, substitute accordingly.
 
@@ -60,11 +70,15 @@ And confirm `gh auth status` reports the account matching `AiUserLogin` (run `gh
 
 **1. The daemon isn't logging anything.**
 ```powershell
-Get-Service AiDaemon                                                # Running?
-Get-Content C:\ProgramData\AiDaemon\aidaemon.lock                   # who owns the lock
+Get-ScheduledTask -TaskName AiDaemon | Select TaskName, State        # Running / Ready / Disabled?
+Get-Content C:\ProgramData\AiDaemon\aidaemon.lock                    # who owns the lock
 Get-ChildItem C:\ProgramData\AiDaemon\logs\ | Sort LastWriteTime -Descending | Select -First 1
 ```
-If the service is stopped, `Start-Service AiDaemon`. If it's running but the log isn't updating, check Event Viewer → Windows Logs → System for `AiDaemon` crash entries — `sc.exe failure` will restart it but a crash loop has a 5/5/30s cadence visible in the log.
+If the task is `Ready` (not running), kick it: `Start-ScheduledTask -TaskName AiDaemon`. If it's `Running` but the log isn't updating, check the last run result and history:
+```powershell
+Get-ScheduledTaskInfo -TaskName AiDaemon | Select LastRunTime, LastTaskResult, NumberOfMissedRuns
+```
+A non-zero `LastTaskResult` is the Win32 exit code of the most recent failure. Task Scheduler restarts the daemon up to 3 times at 1-minute intervals on crash; a tight loop is visible in the log.
 
 **2. Polling logs are running but no ntfy buzz.**
 ```powershell
@@ -75,18 +89,14 @@ Select-String -Path C:\ProgramData\AiDaemon\logs\*.log -Pattern "NtfyPusher|ntfy
 ```
 If you see `dropped:` outcomes — the comment didn't match `ActionableReasons` or matched an `L2DropPatterns`. If you see `escalated`/`spawned:` but no `ntfy push returned`, the topic is unset or the body is wrong.
 
-**2b. Service won't start — Error 1069 "logon failure".**
-The account is missing the `SeServiceLogonRight` ("Log on as a service") privilege. `sc.exe` is supposed to grant this when `install.ps1` passes `password=`, but it silently skips on some Win10/11 SKUs (especially MSA-sign-in boxes). `install.ps1` now runs a `secedit /configure` pass to grant it explicitly; if you installed before that change, grant it manually:
+**2b. Task is registered but never runs.**
+Check the principal's logon type and that the user is actually signed in:
 ```powershell
-# elevated
-$sid = (New-Object System.Security.Principal.NTAccount('Jon')).Translate([System.Security.Principal.SecurityIdentifier]).Value
-$inf = "[Unicode]`nUnicode=yes`n[Version]`nsignature=`"`$CHICAGO`$`"`nRevision=1`n[Privilege Rights]`nSeServiceLogonRight = *$sid`n"
-$f = [IO.Path]::ChangeExtension([IO.Path]::GetTempFileName(), '.inf')
-Set-Content $f $inf -Encoding Unicode
-secedit /configure /db ([IO.Path]::ChangeExtension([IO.Path]::GetTempFileName(),'.sdb')) /cfg $f /areas USER_RIGHTS
-Start-Service AiDaemon
+(Get-ScheduledTask -TaskName AiDaemon).Principal | Select UserId, LogonType, RunLevel
+(Get-ScheduledTask -TaskName AiDaemon).Triggers  | Select TriggerType, UserId, Enabled
+quser                                                                # is the task's UserId logged on?
 ```
-Or via UI: `secpol.msc` → Local Policies → User Rights Assignment → "Log on as a service" → Add User. If the password is wrong instead, `Start-Service` returns 1069 with the same message — distinguish by validating against the local SAM (`[System.DirectoryServices.AccountManagement.PrincipalContext]::new('Machine').ValidateCredentials('Jon', $pw)` returning `False` ⇒ password problem, not rights).
+Expected: `LogonType=Interactive`, `RunLevel=Limited`, an `AtLogOn` trigger keyed to your user, and that user present in `quser` output. `Interactive` means "run only when the user is logged on" — switching to `S4U` or `Password` would let the task run headless but would also strip the interactive desktop, defeating RC window visibility.
 
 **3. Pings stopped after a token rotation.**
 Auth health checks fire at startup; if they fail, the daemon pushes a high-priority alert (title `AiDaemon: gh not authenticated` or `AiDaemon: gh token invalid`). Without that buzz, the runtime probe still logs `Critical`. To recheck manually:
@@ -94,7 +104,7 @@ Auth health checks fire at startup; if they fail, the daemon pushes a high-prior
 gh auth status                                                       # local config
 gh api /user                                                         # live token
 ```
-Re-login if needed, then restart the service: `Restart-Service AiDaemon`.
+Re-login if needed, then bounce the daemon: `Stop-ScheduledTask -TaskName AiDaemon; Start-ScheduledTask -TaskName AiDaemon`.
 
 **4. The phone topic looks dead.**
 ```powershell
@@ -117,17 +127,17 @@ A stale `rc_url` is reaped by the 60s sweep when the process or bridge dies. For
 |---|---|
 | Pause polling (keep daemon running) | `New-Item C:\ProgramData\AiDaemon\PAUSED -ItemType File -Force` |
 | Resume polling | `Remove-Item C:\ProgramData\AiDaemon\PAUSED` |
-| Rotate ntfy topic | Edit `appsettings.Local.json` → `Restart-Service AiDaemon` → resubscribe on phone |
+| Rotate ntfy topic | Edit `appsettings.Local.json` → `Stop-ScheduledTask AiDaemon; Start-ScheduledTask AiDaemon` → resubscribe on phone |
 | Inspect state DB | `sqlite3 C:\ProgramData\AiDaemon\state.db ".tables"` then `SELECT * FROM branches` |
 | Tail today's log | `Get-Content C:\ProgramData\AiDaemon\logs\ai-daemon-$(Get-Date -Format yyyyMMdd).log -Wait` |
 | Reseed a single kv entry | `AiDaemon.exe set-kv <key> <value>` (one-shot subcommand) |
-| Wipe all state (nuclear) | `Stop-Service AiDaemon; Remove-Item C:\ProgramData\AiDaemon -Recurse; Start-Service AiDaemon` |
+| Wipe all state (nuclear) | `Stop-ScheduledTask AiDaemon; Remove-Item C:\ProgramData\AiDaemon -Recurse; Start-ScheduledTask AiDaemon` |
 
 ### Warnings
 
-- **Never run `claude --resume <sid>` against a worktree containing `.daemon-active`** — this violates the single-writer invariant (two processes appending to the same JSONL ⇒ corrupted history). The marker file is the safety net; if you genuinely need to drive a session by hand, stop the service or wait for the idle-timeout sweep to reap it.
-- **PATH for the service identity.** `claude` and `gh` need to be reachable from the service account's user PATH. The reliable workaround is to set absolute paths in `appsettings.json` (`"ClaudePath": "C:\\Users\\Jon\\AppData\\Roaming\\npm\\claude.cmd"`); the brittle one is to augment `HKLM\SYSTEM\CurrentControlSet\Services\AiDaemon\Environment` and reboot. The Windows Service Control Manager does not inherit user-PATH at start time.
-- **Don't run the daemon as LocalSystem.** Under LocalSystem, `%USERPROFILE%` resolves to `C:\Windows\System32\config\systemprofile`, which breaks `~/.claude/sessions/<PID>.json` reads and WMI cross-session lookups. The install script defaults to a named user.
+- **Never run `claude --resume <sid>` against a worktree containing `.daemon-active`** — this violates the single-writer invariant (two processes appending to the same JSONL ⇒ corrupted history). The marker file is the safety net; if you genuinely need to drive a session by hand, stop the task (`Stop-ScheduledTask AiDaemon`) or wait for the idle-timeout sweep to reap it.
+- **The task must run as a real user, not as `SYSTEM` or `LOCAL SERVICE`.** Those identities resolve `%USERPROFILE%` to `C:\Windows\System32\config\systemprofile`, which breaks `~/.claude/sessions/<PID>.json` reads. They also live in session 0, which voids the whole reason we picked a scheduled task. `install.ps1` defaults to the invoking user, which is what you want.
+- **Logging out kills the daemon.** With `LogonType Interactive` the task stops when the user signs out. That's intentional — RC windows can't survive their parent desktop disappearing — but it does mean a deliberate sign-out pauses pings until next logon. To keep things polling while away from the desk, leave the session active (lock-screen is fine) rather than signing out.
 
 ## Development
 

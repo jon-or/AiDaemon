@@ -27,6 +27,15 @@ public interface IGhClient
     Task MarkThreadReadAsync(string threadId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// GET <c>/notifications/threads/{id}</c> — returns the single notification fresh from
+    /// GitHub. Used by the tray Retry path: the cursor has long since advanced past this
+    /// thread, so the regular <see cref="ListNotificationsAsync"/> stream won't yield it
+    /// again on the next poll, even after we delete the dedup row. Returns <c>null</c> when
+    /// GitHub responds 404 (thread expired or never existed).
+    /// </summary>
+    Task<GhNotification?> GetNotificationThreadAsync(string threadId, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Dereferences <c>subject.latest_comment_url</c> (or the subject URL itself if there's no latest comment).
     /// Returns <c>null</c> if the URL is missing.
     /// </summary>

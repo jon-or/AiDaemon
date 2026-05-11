@@ -43,7 +43,33 @@ public class SqliteStateStore : IStateStore
         await using var conn = await OpenAsync(cancellationToken);
         await conn.ExecuteAsync(new CommandDefinition(schema, cancellationToken: cancellationToken));
 
+        await ApplyAdditiveMigrationsAsync(conn, cancellationToken);
+
         _logger.LogInformation("State store initialized at {Connection}", _connectionString);
+    }
+
+    /// <summary>
+    /// SQLite's <c>CREATE TABLE IF NOT EXISTS</c> is no-op on an existing table even if its
+    /// columns drift from the canonical schema. For DBs created before a column was added we
+    /// need an explicit <c>ALTER TABLE ADD COLUMN</c>. SQLite has no <c>IF NOT EXISTS</c>
+    /// modifier on ADD COLUMN, so we read <c>pragma_table_info</c> first and only add what's
+    /// missing. Keep this idempotent: every block must be safe to re-run on a fresh DB.
+    /// </summary>
+    static async Task ApplyAdditiveMigrationsAsync(SqliteConnection conn, CancellationToken cancellationToken)
+    {
+        var processedColumns = (await conn.QueryAsync<string>(new CommandDefinition(
+            "select name from pragma_table_info('processed')",
+            cancellationToken: cancellationToken))).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        async Task AddIfMissing(string column, string ddl)
+        {
+            if (processedColumns.Contains(column)) return;
+            await conn.ExecuteAsync(new CommandDefinition(ddl, cancellationToken: cancellationToken));
+        }
+
+        await AddIfMissing("repo",         "alter table processed add column repo TEXT");
+        await AddIfMissing("title",        "alter table processed add column title TEXT");
+        await AddIfMissing("subject_type", "alter table processed add column subject_type TEXT");
     }
 
     public async Task<bool> IsProcessedAsync(string threadId, string commentId, CancellationToken cancellationToken)
@@ -57,16 +83,22 @@ public class SqliteStateStore : IStateStore
         return hit is not null;
     }
 
-    public async Task MarkProcessedAsync(string threadId, string commentId, string outcome, CancellationToken cancellationToken)
+    public async Task MarkProcessedAsync(string threadId, string commentId, string outcome, ProcessedContext? context, CancellationToken cancellationToken)
     {
         await using var conn = await OpenAsync(cancellationToken);
+        // ON CONFLICT preserves any previously-captured display context if the new write
+        // doesn't have one — i.e. a hypothetical future code path that re-marks a row with
+        // null context won't blank out the repo/title columns we relied on for Retry labels.
         await conn.ExecuteAsync(new CommandDefinition(
             """
-            insert into processed (thread_id, comment_id, processed_at, outcome)
-            values ($tid, $cid, $ts, $outcome)
+            insert into processed (thread_id, comment_id, processed_at, outcome, repo, title, subject_type)
+            values ($tid, $cid, $ts, $outcome, $repo, $title, $type)
             on conflict (thread_id, comment_id) do update set
               processed_at = excluded.processed_at,
-              outcome      = excluded.outcome
+              outcome      = excluded.outcome,
+              repo         = coalesce(excluded.repo,         processed.repo),
+              title        = coalesce(excluded.title,        processed.title),
+              subject_type = coalesce(excluded.subject_type, processed.subject_type)
             """,
             new
             {
@@ -74,8 +106,47 @@ public class SqliteStateStore : IStateStore
                 cid = commentId,
                 ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                 outcome,
+                repo = context?.Repo,
+                title = context?.Title,
+                type = context?.SubjectType,
             },
             cancellationToken: cancellationToken));
+    }
+
+    public async Task<IReadOnlyList<ProcessedEntry>> ListRecentProcessedAsync(int limit, CancellationToken cancellationToken)
+    {
+        if (limit <= 0) return Array.Empty<ProcessedEntry>();
+
+        await using var conn = await OpenAsync(cancellationToken);
+        var rows = await conn.QueryAsync<ProcessedRow>(new CommandDefinition(
+            """
+            select thread_id, comment_id, processed_at, outcome, repo, title, subject_type
+            from processed
+            order by processed_at desc
+            limit $limit
+            """,
+            new { limit },
+            cancellationToken: cancellationToken));
+
+        return rows.Select(r => new ProcessedEntry(
+            ThreadId:     r.thread_id,
+            CommentId:    r.comment_id,
+            ProcessedAt:  DateTimeOffset.FromUnixTimeSeconds(r.processed_at),
+            Outcome:      r.outcome,
+            Repo:         r.repo,
+            Title:        r.title,
+            SubjectType:  r.subject_type)).ToList();
+    }
+
+    public async Task<bool> UnmarkProcessedAsync(string threadId, string commentId, CancellationToken cancellationToken)
+    {
+        await using var conn = await OpenAsync(cancellationToken);
+        var rows = await conn.ExecuteAsync(new CommandDefinition(
+            "delete from processed where thread_id = $tid and comment_id = $cid",
+            new { tid = threadId, cid = commentId },
+            cancellationToken: cancellationToken));
+
+        return rows > 0;
     }
 
     public async Task<int> PruneProcessedAsync(DateTimeOffset cutoff, CancellationToken cancellationToken)
@@ -216,6 +287,18 @@ public class SqliteStateStore : IStateStore
             cancellationToken: cancellationToken));
 
         return conn;
+    }
+
+    /// <summary>Internal row shape for the processed table — mirrors columns for Dapper hydration.</summary>
+    class ProcessedRow
+    {
+        public string thread_id { get; set; } = "";
+        public string comment_id { get; set; } = "";
+        public long processed_at { get; set; }
+        public string outcome { get; set; } = "";
+        public string? repo { get; set; }
+        public string? title { get; set; }
+        public string? subject_type { get; set; }
     }
 
     /// <summary>Internal row shape — mirrors the table for Dapper hydration.</summary>

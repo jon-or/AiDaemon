@@ -123,7 +123,7 @@ public class WorkerTests
             .ReturnsAsync(DispatchOutcome.Spawned);
 
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         _store.Setup(s => s.IncrementRateLimitAsync(
                 It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
@@ -152,11 +152,13 @@ public class WorkerTests
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-A", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("spawned:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-B", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("spawned:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
 
@@ -182,7 +184,7 @@ public class WorkerTests
             .ReturnsAsync(((TriageVerdict?)TriageVerdict.Drop("L1 unsupported"), "", "alice"));
 
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         await Build().TickAsync(default);
@@ -192,6 +194,7 @@ public class WorkerTests
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-A", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("failed:quick-triage:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
 
@@ -199,6 +202,7 @@ public class WorkerTests
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-B", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("dropped:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
 
@@ -230,7 +234,7 @@ public class WorkerTests
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(DispatchOutcome.Failed);
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         await Build().TickAsync(default);
@@ -241,6 +245,7 @@ public class WorkerTests
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-A", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("failed:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
     }
@@ -262,7 +267,7 @@ public class WorkerTests
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(TriageVerdict.Drop("noise"));
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         await Build().TickAsync(default);
@@ -281,6 +286,7 @@ public class WorkerTests
             _store.Verify(s => s.MarkProcessedAsync(
                 id, It.IsAny<string>(),
                 It.Is<string>(o => o.StartsWith("dropped:")),
+                It.IsAny<ProcessedContext?>(),
                 It.IsAny<CancellationToken>()),
                 Times.Once);
     }
@@ -314,7 +320,7 @@ public class WorkerTests
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync(DispatchOutcome.Spawned);
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         _store.Setup(s => s.IncrementRateLimitAsync(
                 It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
@@ -355,7 +361,7 @@ public class WorkerTests
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(DispatchOutcome.Spawned);
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         _store.Setup(s => s.IncrementRateLimitAsync(
                 It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
@@ -541,7 +547,7 @@ public class WorkerTests
         _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("git wedged"));
         _store.Setup(s => s.MarkProcessedAsync(
-                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         await Build().TickAsync(default);
@@ -549,6 +555,7 @@ public class WorkerTests
         _store.Verify(s => s.MarkProcessedAsync(
             "thread-X", It.IsAny<string>(),
             It.Is<string>(o => o.StartsWith("failed:resolve:")),
+            It.IsAny<ProcessedContext?>(),
             It.IsAny<CancellationToken>()),
             Times.Once);
         _triage.Verify(t => t.AgentTriageAsync(

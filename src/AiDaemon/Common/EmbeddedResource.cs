@@ -11,15 +11,24 @@ static class EmbeddedResource
     /// </summary>
     public static string Load(Assembly assembly, string fileName)
     {
+        using var stream = OpenStream(assembly, fileName);
+        using var reader = new StreamReader(stream);
+
+        return reader.ReadToEnd();
+    }
+
+    /// <summary>
+    /// Open an embedded resource as a stream so binary assets (icons, etc.) skip the text
+    /// reader. Caller is responsible for disposing.
+    /// </summary>
+    public static Stream OpenStream(Assembly assembly, string fileName)
+    {
         var name = assembly.GetManifestResourceNames()
             .FirstOrDefault(n => n.EndsWith("." + fileName, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException(
                 $"Embedded resource {fileName} not found. Check AiDaemon.csproj <EmbeddedResource> entries.");
 
-        using var stream = assembly.GetManifestResourceStream(name)
+        return assembly.GetManifestResourceStream(name)
             ?? throw new InvalidOperationException($"Failed to open embedded resource {name}");
-        using var reader = new StreamReader(stream);
-
-        return reader.ReadToEnd();
     }
 }

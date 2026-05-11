@@ -54,6 +54,27 @@ public class GhClient : IGhClient
     public Task MarkThreadReadAsync(string threadId, CancellationToken cancellationToken)
         => ApiVoidAsync("PATCH", $"/notifications/threads/{threadId}", cancellationToken);
 
+    public async Task<GhNotification?> GetNotificationThreadAsync(string threadId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(threadId))
+            return null;
+
+        var path = $"/notifications/threads/{threadId}";
+        try
+        {
+            var result = await RunGhAsync(new[] { "api", path }, cancellationToken);
+            return Deserialize<GhNotification>(result.Stdout, path);
+        }
+        catch (GhCliException ex) when (ex.Stderr.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+        {
+            // Thread aged out of GitHub's notification window (typically ~5 months) or never
+            // existed for this account. Caller surfaces this to the operator rather than
+            // exploding the tray.
+            _logger.LogDebug("notifications/threads/{ThreadId} 404'd", threadId);
+            return null;
+        }
+    }
+
     public async Task<CommentInfo?> GetCommentAsync(string url, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(url))

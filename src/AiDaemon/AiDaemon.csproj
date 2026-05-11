@@ -7,11 +7,33 @@
     <RootNamespace>AiDaemon</RootNamespace>
     <AssemblyName>AiDaemon</AssemblyName>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!--
+      WinExe sets the PE subsystem to GUI (2) instead of Console (3), so Windows does NOT
+      allocate a console window when the scheduled task launches AiDaemon.exe at logon.
+      The tray icon (see TrayHost) is the visible surface; the console would just be noise.
+      `dotnet run` still pipes stdout/stderr because the dotnet host redirects them via
+      pipes regardless of the child's subsystem; developer ergonomics are unaffected.
+      The Serilog console sink writes to a null stream under WinExe (harmless); the file
+      sink under C:\ProgramData\AiDaemon\logs\ is the authoritative log.
+    -->
+    <OutputType>WinExe</OutputType>
+    <!--
+      UseWindowsForms is needed for NotifyIcon (system tray icon). The TFM is already
+      net10.0-windows so we're not pulling in any extra platform constraint; this just
+      adds the WinForms reference and the WPF/WinForms framework pack. The host stays a
+      plain BackgroundService worker; the tray icon runs on its own STA thread so we
+      don't accidentally turn the daemon into a UI-thread-bound app.
+    -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="Resources\app-paused.ico" />
+    <None Remove="Resources\app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.3" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.3" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.3" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
     <PackageReference Include="Dapper" Version="2.1.66" />
@@ -43,6 +65,9 @@
   </Target>
 
   <ItemGroup>
+    <EmbeddedResource Include="Resources\app-paused.ico" />
+    <EmbeddedResource Include="Resources\app.ico" />
+    <EmbeddedResource Include="Resources\app_old.ico" />
     <EmbeddedResource Include="Storage\Schema.sql" />
     <EmbeddedResource Include="Triage\system-prompt.md" />
     <EmbeddedResource Include="Triage\pre-run-prompt.md" />
