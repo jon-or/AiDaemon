@@ -63,6 +63,16 @@ public class NtfyPusher : INotificationPusher
             sessionUrl: url,
             cancellationToken: cancellationToken);
 
+    public Task PushAlertAsync(string title, string body, CancellationToken cancellationToken)
+        => PostAsync(
+            title: title,
+            message: body,
+            priority: _options.Ntfy.PriorityHigh,
+            branch: null,
+            sessionUrl: "",
+            tags: new[] { "warning" },
+            cancellationToken: cancellationToken);
+
     /// <summary>
     /// Title is the GitHub issue/PR title — what the conversation is actually about. Falls
     /// back to the branch name when no subject title was supplied (defensive; in practice
@@ -101,9 +111,14 @@ public class NtfyPusher : INotificationPusher
     /// Builds the action-button strip: Open PR (when the branch resolved to a PR), Open
     /// Issue (when it resolved to an issue), Open Claude (always, RC URL or fallback).
     /// ntfy supports up to 3 custom view actions per notification — exactly enough.
+    /// Returns an empty array when <paramref name="branch"/> is null (operator alerts have
+    /// no branch context, so no buttons fit).
     /// </summary>
-    static NtfyAction[] BuildActions(BranchInfo branch, string sessionUrl)
+    static NtfyAction[] BuildActions(BranchInfo? branch, string sessionUrl)
     {
+        if (branch == null)
+            return Array.Empty<NtfyAction>();
+
         var list = new List<NtfyAction>(3);
 
         if (branch.PrNumber is int pr)
@@ -133,8 +148,9 @@ public class NtfyPusher : INotificationPusher
     }
 
     async Task PostAsync(
-        string title, string message, int priority, BranchInfo branch, string sessionUrl,
-        CancellationToken cancellationToken)
+        string title, string message, int priority, BranchInfo? branch, string sessionUrl,
+        CancellationToken cancellationToken,
+        string[]? tags = null)
     {
         var topic = _options.Ntfy.Topic;
         if (string.IsNullOrWhiteSpace(topic))
@@ -155,7 +171,7 @@ public class NtfyPusher : INotificationPusher
             Message = message,
             Markdown = true,
             Priority = priority,
-            Tags = new[] { "robot" },
+            Tags = tags ?? new[] { "robot" },
             Actions = BuildActions(branch, sessionUrl),
         };
 

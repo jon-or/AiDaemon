@@ -28,6 +28,20 @@
     <None Update="appsettings.Local.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('appsettings.Local.json')" />
   </ItemGroup>
 
+  <!--
+    Keep appsettings.Development.json out of `dotnet publish` output. We DO want it at
+    bin/ time so `dotnet run` picks up Debug logging + 10s poll interval, but shipping it
+    means anyone flipping DOTNET_ENVIRONMENT=Development on the prod service box would
+    silently inherit those dev settings. The SDK's CopyToPublishDirectory="Never"
+    metadata on <None Update> items is not honored reliably across SDK versions, so we
+    remove the file explicitly from ResolvedFileToPublish before the copy stage runs.
+  -->
+  <Target Name="ExcludeDevelopmentAppsettingsFromPublish" BeforeTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Filename)%(Extension)' == 'appsettings.Development.json'" />
+    </ItemGroup>
+  </Target>
+
   <ItemGroup>
     <EmbeddedResource Include="Storage\Schema.sql" />
     <EmbeddedResource Include="Triage\system-prompt.md" />

@@ -114,6 +114,24 @@ public class GhClient : IGhClient
         return doc.TryGetProperty("login", out var login) ? login.GetString() ?? "" : "";
     }
 
+    public async Task<string> AuthStatusAsync(CancellationToken cancellationToken)
+    {
+        // Bypass RunGhAsync's auth-detection path: non-zero exit from `gh auth status` is by
+        // definition an auth failure (the command's whole job is to report auth state), so
+        // any failure here should always raise GhAuthException regardless of stderr keywords.
+        var result = await _runner.RunAsync(
+            _options.GhPath, new[] { "auth", "status" }, cancellationToken: cancellationToken);
+
+        // gh 2.x writes the human-readable report to stderr; newer versions may use stdout.
+        // Coalesce so the caller's log line carries the actual report text regardless.
+        var output = string.IsNullOrWhiteSpace(result.Stdout) ? result.Stderr : result.Stdout;
+
+        if (!result.Succeeded)
+            throw new GhAuthException(result.ExitCode, output);
+
+        return output.Trim();
+    }
+
     async Task<ProcessResult> RunGhAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
     {
         var result = await _runner.RunAsync(_options.GhPath, args, cancellationToken: cancellationToken);

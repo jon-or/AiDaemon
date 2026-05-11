@@ -31,6 +31,7 @@ public class Worker : BackgroundService
     readonly IBranchResolver _resolver;
     readonly IDispatcher _dispatcher;
     readonly IGhClient _gh;
+    readonly INotificationPusher _pusher;
 
     /// <summary>
     /// Single-instance lock. We use an exclusive file handle (FileShare.None) instead of a
@@ -51,7 +52,8 @@ public class Worker : BackgroundService
         ITriagePipeline triage,
         IBranchResolver resolver,
         IDispatcher dispatcher,
-        IGhClient gh)
+        IGhClient gh,
+        INotificationPusher pusher)
     {
         _logger = logger;
         _options = options;
@@ -62,6 +64,7 @@ public class Worker : BackgroundService
         _resolver = resolver;
         _dispatcher = dispatcher;
         _gh = gh;
+        _pusher = pusher;
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
@@ -95,31 +98,11 @@ public class Worker : BackgroundService
 
         // gh-auth probe. We don't want every poll's "no notifications" log entry to be the
         // first hint that gh isn't logged in — surface the configuration mistake at startup
-        // with a single explicit message. We intentionally don't fail-fast: the operator
-        // might `gh auth login` while we're running, and the actual poll path has its own
-        // GhAuthException handling that emits warnings on every tick until it recovers.
-        try
-        {
-            var login = await _gh.WhoAmIAsync(cancellationToken);
-            _logger.LogInformation("gh authenticated as {Login}", string.IsNullOrEmpty(login) ? "(no login field returned)" : login);
-
-            if (!string.IsNullOrEmpty(_options.Value.AiUserLogin)
-                && !string.Equals(login, _options.Value.AiUserLogin, StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogWarning(
-                    "gh login {Actual} does not match configured AiUserLogin {Configured} — self-authored notifications will not be filtered",
-                    login, _options.Value.AiUserLogin);
-            }
-        }
-        catch (GhAuthException ex)
-        {
-            _logger.LogCritical(ex,
-                "gh is not authenticated at startup. The daemon will tick but every poll will fail until `gh auth login` is run.");
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogError(ex, "gh /user probe failed at startup — continuing degraded");
-        }
+        // with a single explicit message AND a high-priority ntfy push so an operator who
+        // walked away from the laptop sees it on their phone. We intentionally don't
+        // fail-fast: the operator might `gh auth login` while we're running, and the actual
+        // poll path has its own GhAuthException handling.
+        await ProbeGhAuthAsync(cancellationToken);
 
         try
         {
@@ -197,6 +180,88 @@ public class Worker : BackgroundService
         }
 
         _logger.LogInformation("AiDaemon worker stopping");
+    }
+
+    /// <summary>
+    /// Two-step startup probe: <c>gh auth status</c> (offline — local token shape + scopes)
+    /// followed by <c>gh api /user</c> (online — live token validation). Either failing
+    /// fires a high-priority ntfy alert so the operator's phone buzzes; the daemon keeps
+    /// running because a `gh auth login` mid-flight is a normal recovery path.
+    /// </summary>
+    internal async Task ProbeGhAuthAsync(CancellationToken cancellationToken)
+    {
+        string? statusReport = null;
+        try
+        {
+            statusReport = await _gh.AuthStatusAsync(cancellationToken);
+            // gh's report is multi-line; log it at Information so an operator grepping the
+            // log can see exactly which host / scopes are in play without re-running gh.
+            _logger.LogInformation("gh auth status:\n{Report}", statusReport);
+        }
+        catch (GhAuthException ex)
+        {
+            _logger.LogCritical(ex,
+                "gh auth status reports no authentication. Run `gh auth login` to authenticate.");
+            await TryPushAuthAlertAsync(
+                "AiDaemon: gh not authenticated",
+                $"`gh auth status` failed at startup. Run `gh auth login`.\n\n```\n{ex.Stderr.Trim()}\n```",
+                cancellationToken);
+            return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "gh auth status probe failed at startup — continuing degraded");
+            // Don't push for unknown failures (e.g. gh CLI missing entirely): the live
+            // /user probe below will catch the same thing with a better diagnostic.
+        }
+
+        try
+        {
+            var login = await _gh.WhoAmIAsync(cancellationToken);
+            _logger.LogInformation("gh authenticated as {Login}",
+                string.IsNullOrEmpty(login) ? "(no login field returned)" : login);
+
+            if (!string.IsNullOrEmpty(_options.Value.AiUserLogin)
+                && !string.Equals(login, _options.Value.AiUserLogin, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "gh login {Actual} does not match configured AiUserLogin {Configured} — self-authored notifications will not be filtered",
+                    login, _options.Value.AiUserLogin);
+            }
+        }
+        catch (GhAuthException ex)
+        {
+            _logger.LogCritical(ex,
+                "gh /user returned an auth failure. The daemon will tick but every poll will fail until `gh auth login` is run.");
+            await TryPushAuthAlertAsync(
+                "AiDaemon: gh token invalid",
+                $"`gh api /user` failed at startup. Run `gh auth login`.\n\n```\n{ex.Stderr.Trim()}\n```",
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "gh /user probe failed at startup — continuing degraded");
+            await TryPushAuthAlertAsync(
+                "AiDaemon: gh probe failed",
+                $"`gh api /user` threw at startup: {ex.GetType().Name}: {ex.Message}",
+                cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Push wrapper that swallows its own failures. An ntfy outage during startup must not
+    /// prevent the daemon from coming up — the log already carries the diagnostic.
+    /// </summary>
+    async Task TryPushAuthAlertAsync(string title, string body, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _pusher.PushAlertAsync(title, body, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "auth-alert push failed (continuing)");
+        }
     }
 
     /// <summary>Retention horizon for the dedup table. Anything older than this is safe to drop:

@@ -29,6 +29,16 @@ public interface INotificationPusher
         string subjectTitle,
         TriageVerdict verdict,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Operator-facing alert (no branch context). High priority. Used when the daemon
+    /// itself is in trouble — auth failures at startup, gh CLI missing, etc. — so the
+    /// operator sees it on their phone even though it isn't a real notification event.
+    /// </summary>
+    Task PushAlertAsync(
+        string title,
+        string body,
+        CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -62,6 +72,12 @@ public class NoopNotificationPusher : INotificationPusher
         _logger.LogInformation(
             "[push] heads-up branch={Branch} url={Url} title={Title} summary={Summary}",
             branch.Key, url, subjectTitle, verdict.Summary);
+        return Task.CompletedTask;
+    }
+
+    public Task PushAlertAsync(string title, string body, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("[push] alert title={Title} body={Body}", title, body);
         return Task.CompletedTask;
     }
 }

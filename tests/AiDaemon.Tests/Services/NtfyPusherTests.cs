@@ -236,6 +236,39 @@ public class NtfyPusherTests
     }
 
     [Fact]
+    public async Task PushAlert_UsesHighPriority_WarningTag_NoActionButtons()
+    {
+        // Operator-facing alert: high priority so the phone pings; warning tag (different
+        // glyph than the robot tag on real notifications); no button strip (no branch
+        // context to render buttons for).
+        await Build().PushAlertAsync(
+            "AiDaemon: gh not authenticated",
+            "`gh auth status` failed at startup.",
+            default);
+
+        var json = ParseBody(_handler.Calls[0].Body);
+        Assert.Equal(4, json.GetProperty("priority").GetInt32());
+        Assert.Equal("AiDaemon: gh not authenticated", json.GetProperty("title").GetString());
+        Assert.Equal("`gh auth status` failed at startup.", json.GetProperty("message").GetString());
+
+        var tags = json.GetProperty("tags").EnumerateArray().Select(e => e.GetString()).ToArray();
+        Assert.Equal(new[] { "warning" }, tags);
+
+        var actions = json.GetProperty("actions").EnumerateArray().ToList();
+        Assert.Empty(actions);
+    }
+
+    [Fact]
+    public async Task PushAlert_EmptyTopic_SkipsPostAndDoesNotThrow()
+    {
+        _options.Ntfy.Topic = "";
+
+        await Build().PushAlertAsync("title", "body", default);
+
+        Assert.Empty(_handler.Calls);
+    }
+
+    [Fact]
     public async Task EmptyTopic_SkipsPostAndDoesNotThrow()
     {
         // Forgotten / unset Ntfy.Topic shouldn't crash dispatch — push is best-effort.

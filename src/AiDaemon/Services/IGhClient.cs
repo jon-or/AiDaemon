@@ -44,6 +44,15 @@ public interface IGhClient
 
     /// <summary>Lightweight auth probe: <c>gh api /user</c>. Throws on failure.</summary>
     Task<string> WhoAmIAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs <c>gh auth status</c> and returns the human-readable report (host, account,
+    /// scopes). Throws <see cref="GhAuthException"/> when gh exits non-zero — the command's
+    /// whole purpose is reporting auth state, so a non-zero exit is by definition an auth
+    /// problem. Used by the startup health probe to surface "you forgot to run gh auth
+    /// login" loudly enough that an operator sees it before the first poll fails.
+    /// </summary>
+    Task<string> AuthStatusAsync(CancellationToken cancellationToken);
 }
 
 public class GhCliException : Exception

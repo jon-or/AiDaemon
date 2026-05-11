@@ -24,6 +24,7 @@ public class WorkerTests
     readonly Mock<IDispatcher> _dispatcher = new(MockBehavior.Strict);
     readonly Mock<IStateStore> _store = new(MockBehavior.Strict);
     readonly Mock<IGhClient> _gh = new(MockBehavior.Strict);
+    readonly Mock<INotificationPusher> _pusher = new(MockBehavior.Loose);
     readonly Mock<IHostApplicationLifetime> _lifetime = new();
     readonly DaemonOptions _options = new()
     {
@@ -50,7 +51,8 @@ public class WorkerTests
             _triage.Object,
             _resolver.Object,
             _dispatcher.Object,
-            _gh.Object);
+            _gh.Object,
+            _pusher.Object);
     }
 
     static GhNotification N(string id, string commentUrl, DateTimeOffset? updated = null) => new()
@@ -398,7 +400,7 @@ public class WorkerTests
         // Build manually so the default GetKv setup in Build() doesn't override ours.
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object, _pusher.Object);
 
         await w.TickAsync(default);
 
@@ -420,7 +422,7 @@ public class WorkerTests
 
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object, _pusher.Object);
 
         await w.TickAsync(default);
 
@@ -447,7 +449,7 @@ public class WorkerTests
 
         var w = new Worker(
             NullLogger<Worker>.Instance, Options.Create(_options), _lifetime.Object,
-            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object);
+            _store.Object, _poller.Object, _triage.Object, _resolver.Object, _dispatcher.Object, _gh.Object, _pusher.Object);
 
         // Should not throw — the catch in TryPruneProcessedAsync swallows non-OCE.
         await w.TickAsync(default);
@@ -456,6 +458,76 @@ public class WorkerTests
         _store.Verify(s => s.SetKvAsync(
             StateStoreKeys.ProcessedLastPruned, It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never);
+    }
+
+    [Fact]
+    public async Task ProbeGhAuth_AuthStatusFails_PushesHighPriorityAlert()
+    {
+        // Operator who walked away from the laptop won't see a Critical log line, but they
+        // will see a ntfy buzz. AuthStatusAsync failing → PushAlertAsync must fire.
+        _gh.Setup(g => g.AuthStatusAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhAuthException(1, "You are not logged into any GitHub hosts."));
+        // /user is still tried after auth-status; have it fail too (same root cause).
+        _gh.Setup(g => g.WhoAmIAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhAuthException(1, "HTTP 401 Bad credentials"));
+
+        await Build().ProbeGhAuthAsync(default);
+
+        _pusher.Verify(p => p.PushAlertAsync(
+            It.Is<string>(t => t.Contains("not authenticated", StringComparison.OrdinalIgnoreCase)),
+            It.IsAny<string>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ProbeGhAuth_WhoAmIFails_StillPushesAlert()
+    {
+        // gh auth status might pass (token present locally) while gh api /user 401s (token
+        // revoked server-side or expired). Both paths must produce an alert.
+        _gh.Setup(g => g.AuthStatusAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync("Logged in to github.com as jon-or-ai");
+        _gh.Setup(g => g.WhoAmIAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhAuthException(1, "HTTP 401 Bad credentials"));
+
+        await Build().ProbeGhAuthAsync(default);
+
+        _pusher.Verify(p => p.PushAlertAsync(
+            It.Is<string>(t => t.Contains("token invalid", StringComparison.OrdinalIgnoreCase)),
+            It.IsAny<string>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ProbeGhAuth_AllChecksPass_NoAlert()
+    {
+        _gh.Setup(g => g.AuthStatusAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync("Logged in to github.com as jon-or-ai");
+        _gh.Setup(g => g.WhoAmIAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync("jon-or-ai");
+
+        await Build().ProbeGhAuthAsync(default);
+
+        _pusher.Verify(p => p.PushAlertAsync(
+            It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ProbeGhAuth_AlertPusherThrows_DoesNotPropagate()
+    {
+        // A flaky ntfy backend during startup must not prevent the daemon from coming up.
+        _gh.Setup(g => g.AuthStatusAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhAuthException(1, "No host config found"));
+        _gh.Setup(g => g.WhoAmIAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new GhAuthException(1, "HTTP 401"));
+        _pusher.Setup(p => p.PushAlertAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new HttpRequestException("ntfy unreachable"));
+
+        // Should not throw.
+        await Build().ProbeGhAuthAsync(default);
     }
 
     [Fact]
