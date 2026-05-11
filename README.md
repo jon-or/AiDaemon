@@ -2,7 +2,7 @@
 
 A .NET 10 background worker that polls GitHub notifications scoped to an AI account, triages them with Claude, and spawns a Remote Control claude session per actionable event. The user drives every session — the daemon never edits, commits, or comments on its own.
 
-Runs as a per-user **scheduled task** triggered at logon, not as a Windows Service: every RC session needs a visible PowerShell + claude.exe console window, and services live in session 0 (no interactive desktop). A scheduled task with `LogonType Interactive` runs inside the user's desktop session so RC windows are visible and accept keyboard input.
+Runs as a per-user **scheduled task** triggered at logon, not as a Windows Service: every RC session needs a visible cmd.exe + claude.exe console window, and services live in session 0 (no interactive desktop). A scheduled task with `LogonType Interactive` runs inside the user's desktop session so RC windows are visible and accept keyboard input.
 
 The daemon also surfaces a **system-tray icon** while it's running — right-click for:
 

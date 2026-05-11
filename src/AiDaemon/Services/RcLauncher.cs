@@ -5,7 +5,6 @@ using AiDaemon.Common;
 using AiDaemon.Configuration;
 using AiDaemon.Io;
 using AiDaemon.Models;
-using AiDaemon.Process;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SysProcess = System.Diagnostics.Process;
@@ -14,7 +13,7 @@ namespace AiDaemon.Services;
 
 public class RcLauncher : IRcLauncher
 {
-    /// <summary>How long to poll WMI looking for the inner <c>claude.exe</c> child of PowerShell.</summary>
+    /// <summary>How long to poll WMI looking for the <c>claude.exe</c> child of the spawned cmd.exe.</summary>
     static readonly TimeSpan ChildLookupTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
@@ -26,23 +25,17 @@ public class RcLauncher : IRcLauncher
     /// </summary>
     static readonly TimeSpan RegistryPollTimeout = TimeSpan.FromSeconds(10);
 
-    /// <summary>How long to wait for the outer Start-Process call to return the inner PS PID.</summary>
-    static readonly TimeSpan StartProcessTimeout = TimeSpan.FromSeconds(10);
-
     static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
 
-    readonly IProcessRunner _runner;
     readonly IFileSystem _fs;
     readonly DaemonOptions _options;
     readonly ILogger<RcLauncher> _logger;
 
     public RcLauncher(
-        IProcessRunner runner,
         IFileSystem fs,
         IOptions<DaemonOptions> options,
         ILogger<RcLauncher> logger)
     {
-        _runner = runner;
         _fs = fs;
         _options = options.Value;
         _logger = logger;
@@ -52,48 +45,62 @@ public class RcLauncher : IRcLauncher
     {
         var rcName = SafeRcName(branch.Branch);
 
-        // The inner command claude actually runs inside the new console window.
-        // Fresh spawn (no sessionId): just --remote-control. claude assigns a new UUID and writes
-        // it to the per-PID registry alongside the bridgeSessionId we'll capture below.
-        // Resume (sessionId provided): --resume <sid> --remote-control to reattach to an existing
-        // conversation. Caveat: claude-code on v2.1.138 prints "No deferred tool marker found …"
-        // on resume of a non-deferred session, but the relay still registers and the bridge
-        // populates as expected.
+        // The command line cmd.exe runs once the new console window comes up. Fresh spawn
+        // (no sessionId): just --remote-control; claude assigns a new UUID and writes it to
+        // the per-PID registry alongside the bridgeSessionId we capture below. Resume
+        // (sessionId provided): --resume <sid> --remote-control reattaches to an existing
+        // conversation. Caveat: claude-code on v2.1.138 prints "No deferred tool marker
+        // found …" on resume of a non-deferred session, but the relay still registers and
+        // the bridge populates as expected.
         var innerCmd = string.IsNullOrEmpty(sessionId)
-            ? $"& \"{_options.ClaudePath}\" --remote-control \"{rcName}\""
-            : $"& \"{_options.ClaudePath}\" --resume {sessionId} --remote-control \"{rcName}\"";
+            ? $"\"{_options.ClaudePath}\" --remote-control \"{rcName}\""
+            : $"\"{_options.ClaudePath}\" --resume {sessionId} --remote-control \"{rcName}\"";
 
-        // Outer PowerShell calls Start-Process to give the inner PowerShell its own console
-        // window — Process.Start with UseShellExecute=false from a Git Bash / dotnet-run parent
-        // would otherwise share the parent's console (and RC silently fails to register on a
-        // shared TTY).
-        var outerScript = BuildStartProcessScript(branch.Worktree, innerCmd);
+        // cmd.exe's argument-parsing rule for /K (and /C): when the first character after
+        // /K is a quote, cmd strips ONE outer pair of quotes. So we wrap the whole inner
+        // command in an extra pair, leaving the inner quotes (around ClaudePath and rcName)
+        // intact so paths with spaces survive. SafeRcName already strips shell-special
+        // characters from the branch, so the rcName interpolation is safe.
+        var cmdArgs = $"/K \"{innerCmd}\"";
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = cmdArgs,
+            WorkingDirectory = branch.Worktree,
+            // UseShellExecute=true is what gives cmd.exe its own visible console window.
+            // The previous PowerShell-via-Start-Process gymnastics existed because
+            // Process.Start with UseShellExecute=false would have made the child share
+            // the parent's console (and RC silently fails to register on a shared TTY).
+            // Under the WinExe daemon there's no parent console at all, but UseShellExecute
+            // remains the correct flag — it asks Windows to allocate a new console for the
+            // child regardless of what the daemon's subsystem looks like.
+            UseShellExecute = true,
+        };
 
         _logger.LogInformation(
-            "spawning RC PowerShell sessionId={Sid} branch={Branch} worktree={Worktree} rcName={RcName}",
+            "spawning RC cmd.exe sessionId={Sid} branch={Branch} worktree={Worktree} rcName={RcName}",
             sessionId ?? "(fresh)", branch.Branch, branch.Worktree, rcName);
 
-        using var startCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        startCts.CancelAfter(StartProcessTimeout);
-
-        var startResult = await _runner.RunAsync(
-            _options.PowerShellPath,
-            new[] { "-NoProfile", "-NonInteractive", "-Command", outerScript },
-            cancellationToken: startCts.Token);
-
-        if (!startResult.Succeeded)
+        SysProcess? launched;
+        try
+        {
+            launched = SysProcess.Start(psi);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             throw new InvalidOperationException(
-                $"Start-Process failed (exit {startResult.ExitCode}): {startResult.Stderr.TruncateWithEllipsis(500)}");
+                $"Failed to launch cmd.exe for RC session ({branch.Branch}): {ex.Message}", ex);
         }
 
-        if (!int.TryParse(startResult.Stdout.Trim(), out var psPid) || psPid <= 0)
+        if (launched == null)
         {
             throw new InvalidOperationException(
-                $"Start-Process did not return a parseable PID. stdout='{startResult.Stdout.TruncateWithEllipsis(200)}' stderr='{startResult.Stderr.TruncateWithEllipsis(200)}'");
+                $"Process.Start returned null for RC session ({branch.Branch})");
         }
 
-        _logger.LogDebug("inner PowerShell PID={PsPid}", psPid);
+        var psPid = launched.Id;
+        _logger.LogDebug("RC cmd.exe PID={PsPid}", psPid);
 
         var (claudePid, claudeStart) = await FindChildClaudeAsync(psPid, cancellationToken);
         var (bridgeId, capturedSid) = await PollRegistryForBridgeAsync(claudePid, cancellationToken);
@@ -221,29 +228,6 @@ public class RcLauncher : IRcLauncher
 
     // ---------------- helpers ----------------
 
-    /// <summary>
-    /// Outer-PowerShell script: launch a new visible console with <see cref="ProcessWindowStyle.Normal"/>,
-    /// run the supplied <paramref name="innerCmd"/> via <c>-NoExit -Command</c>, return the
-    /// inner PowerShell PID on stdout. Uses the same <c>PowerShellPath</c> as the outer call
-    /// so a custom config (e.g. pwsh.exe) is honored on both sides. Single-quotes around
-    /// interpolated paths/cmd are PowerShell single-quoted-string literals; we double any
-    /// embedded apostrophe to escape it.
-    /// </summary>
-    string BuildStartProcessScript(string worktree, string innerCmd)
-    {
-        static string EscapeSingle(string s) => s.Replace("'", "''");
-        var ps = EscapeSingle(_options.PowerShellPath);
-        var wd = EscapeSingle(worktree);
-        var cmd = EscapeSingle(innerCmd);
-
-        return
-            $"$ErrorActionPreference='Stop'; " +
-            $"$p = Start-Process -FilePath '{ps}' -PassThru " +
-            $"-WorkingDirectory '{wd}' " +
-            $"-ArgumentList @('-NoExit','-NoProfile','-Command','{cmd}'); " +
-            $"if ($p) {{ Write-Output $p.Id }} else {{ Write-Error 'Start-Process returned null' }}";
-    }
-
     async Task<(int Pid, DateTime Start)> FindChildClaudeAsync(int parentPid, CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow + ChildLookupTimeout;
@@ -254,7 +238,7 @@ public class RcLauncher : IRcLauncher
             var found = QueryClaudeChild(parentPid);
             if (found.HasValue)
             {
-                _logger.LogDebug("found claude.exe child PID {ClaudePid} of PowerShell {PsPid}", found.Value.Pid, parentPid);
+                _logger.LogDebug("found claude.exe child PID {ClaudePid} of cmd.exe {PsPid}", found.Value.Pid, parentPid);
                 return found.Value;
             }
 
@@ -262,7 +246,7 @@ public class RcLauncher : IRcLauncher
         }
 
         throw new TimeoutException(
-            $"No claude.exe child of PowerShell PID {parentPid} appeared within {ChildLookupTimeout.TotalSeconds:N0}s");
+            $"No claude.exe child of cmd.exe PID {parentPid} appeared within {ChildLookupTimeout.TotalSeconds:N0}s");
     }
 
     static (int Pid, DateTime Start)? QueryClaudeChild(int parentPid)
@@ -348,7 +332,7 @@ public class RcLauncher : IRcLauncher
         {
             var p = SysProcess.GetProcessById(psPid);
             p.Kill(entireProcessTree: true);
-            _logger.LogDebug("killed PowerShell process tree PID={Pid}", psPid);
+            _logger.LogDebug("killed cmd.exe process tree PID={Pid}", psPid);
         }
         catch (ArgumentException)
         {
@@ -356,7 +340,7 @@ public class RcLauncher : IRcLauncher
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "failed to kill PowerShell PID {Pid}", psPid);
+            _logger.LogWarning(ex, "failed to kill cmd.exe PID {Pid}", psPid);
         }
     }
 
@@ -367,10 +351,11 @@ public class RcLauncher : IRcLauncher
 
     /// <summary>
     /// Branch names for fork PRs are attacker-controllable, so we use a strict allowlist
-    /// rather than blacklisting the few PowerShell metachars we noticed. Anything outside
-    /// [A-Za-z0-9._+/-] becomes '-'. The set covers every character `git check-ref-format`
-    /// accepts in a normal branch name plus '+' which appears in version-style branches; it
-    /// excludes the shell-special set ($ ` ' " & | ; ( ) { } > < space).
+    /// rather than blacklisting metachars. Anything outside [A-Za-z0-9._+/-] becomes '-'.
+    /// The set covers every character `git check-ref-format` accepts in a normal branch
+    /// name plus '+' which appears in version-style branches; it excludes the shell-special
+    /// set that's dangerous in either cmd.exe ('&' '|' '<' '>' '^' '%') or PowerShell
+    /// ($ ` ' " ( ) { } and space), so the rcName is safe to interpolate into either.
     /// </summary>
     internal static string SafeRcName(string branch)
     {

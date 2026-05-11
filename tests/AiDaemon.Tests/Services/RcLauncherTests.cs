@@ -1,6 +1,5 @@
 using AiDaemon.Configuration;
 using AiDaemon.Io;
-using AiDaemon.Process;
 using AiDaemon.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -11,16 +10,15 @@ namespace AiDaemon.Tests.Services;
 
 /// <summary>
 /// Pure-function and registry-parsing coverage for <see cref="RcLauncher"/>. The
-/// PowerShell / WMI flow itself is integration territory; this file pins the boundary
+/// cmd.exe spawn / WMI flow itself is integration territory; this file pins the boundary
 /// behaviors that don't need a real process.
 /// </summary>
 public class RcLauncherTests
 {
     readonly Mock<IFileSystem> _fs = new();
-    readonly Mock<IProcessRunner> _runner = new();
-    readonly DaemonOptions _options = new() { ClaudePath = "claude", PowerShellPath = "powershell.exe" };
+    readonly DaemonOptions _options = new() { ClaudePath = "claude" };
 
-    RcLauncher BuildLauncher() => new(_runner.Object, _fs.Object, Options.Create(_options), NullLogger<RcLauncher>.Instance);
+    RcLauncher BuildLauncher() => new(_fs.Object, Options.Create(_options), NullLogger<RcLauncher>.Instance);
 
     static string RegistryPathFor(int pid) => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),

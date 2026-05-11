@@ -10,7 +10,6 @@ public class DaemonOptions
     public string AiUserLogin { get; set; } = "";
     public string WorktreeRoot { get; set; } = "";
     public string ClaudePath { get; set; } = "claude";
-    public string PowerShellPath { get; set; } = "powershell.exe";
     public string GhPath { get; set; } = "gh";
     public List<string> RepoAllowlist { get; set; } = new();
 
