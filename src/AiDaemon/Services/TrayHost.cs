@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using AiDaemon.Common;
 using AiDaemon.Configuration;
+using AiDaemon.Models;
 using AiDaemon.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -194,6 +195,9 @@ public class TrayHost : IHostedService, IDisposable
         _retryRoot = new ToolStripMenuItem("Retry");
         _retryRoot.DropDownItems.Add(new ToolStripMenuItem("(no recent items)") { Enabled = false });
         menu.Items.Add(_retryRoot);
+        menu.Items.Add(new ToolStripSeparator());
+
+        menu.Items.Add(new ToolStripMenuItem("Test RC launch", image: null, (_, _) => OnTestLaunch()));
         menu.Items.Add(new ToolStripSeparator());
 
         menu.Items.Add(new ToolStripMenuItem("Quit", image: null, (_, _) => OnQuit()));
@@ -421,6 +425,76 @@ public class TrayHost : IHostedService, IDisposable
             {
                 _logger.LogError(ex, "Retry failed for thread {ThreadId}", entry.ThreadId);
                 ShowBalloonOnUiThread("Retry failed", ex.Message, ToolTipIcon.Error);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Manual smoke test for the RC spawn chain. We synthesize a BranchInfo pointing at the
+    /// daemon's own DataDir (always exists, no real branch state to clobber) and run it through
+    /// the full <see cref="IRcLauncher.SpawnRcAsync"/> path. This exercises every moving piece
+    /// the cmd.exe refactor touched -- the Process.Start spawn itself, the WMI lookup for the
+    /// claude.exe child of the new cmd.exe PID, the per-PID registry poll for bridgeSessionId,
+    /// and the daemon-active marker write. A success balloon confirms all four; a failure
+    /// surfaces the exact stage that broke (timeout vs. spawn error vs. missing claude path).
+    /// </summary>
+    void OnTestLaunch()
+    {
+        _ = Task.Run(async () =>
+        {
+            // Synthetic branch: SafeRcName leaves "ai-daemon-test-launch" intact (no shell
+            // specials), so the cmd window title will read sensibly. The branch is NOT
+            // persisted to the branches state table -- SpawnRcAsync doesn't touch state,
+            // only the Dispatcher does.
+            var workdir = _options.Value.DataDir;
+            var branch = new BranchInfo(
+                Repo: "ai-daemon/test",
+                Branch: "ai-daemon-test-launch",
+                Worktree: workdir,
+                PrNumber: null,
+                IssueNumber: null);
+
+            try
+            {
+                using var scope = _services.CreateScope();
+                var launcher = scope.ServiceProvider.GetRequiredService<IRcLauncher>();
+                var ct = _lifetime.ApplicationStopping;
+
+                _logger.LogInformation("Test launch starting (worktree={Workdir} rcName={Rc})",
+                    workdir, branch.Branch);
+
+                var att = await launcher.SpawnRcAsync(branch, sessionId: null, ct);
+
+                _logger.LogInformation(
+                    "Test launch succeeded — cmdPid={CmdPid} claudePid={ClaudePid} bridge={Bridge}",
+                    att.PsPid, att.ClaudePid, att.BridgeSessionId);
+
+                ShowBalloonOnUiThread(
+                    "Test launch succeeded",
+                    $"cmd PID {att.PsPid}, claude PID {att.ClaudePid}.\n" +
+                    $"Bridge: {att.BridgeSessionId}\n" +
+                    $"Close the cmd window when done.",
+                    ToolTipIcon.Info);
+            }
+            catch (OperationCanceledException)
+            {
+                // Host shutting down mid-test: silent.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Test launch failed");
+                ShowBalloonOnUiThread("Test launch failed", ex.Message, ToolTipIcon.Error);
+            }
+            finally
+            {
+                // SpawnRcAsync writes .daemon-active into the worktree on success. For a real
+                // branch the marker stays until CleanupAsync reaps the session; for our
+                // synthetic DataDir worktree it would just sit there until reboot, confusing
+                // anyone reading C:\ProgramData\AiDaemon. Delete it unconditionally -- it's
+                // either ours (test) or wasn't written (failure path), and a missing-file
+                // delete is silent.
+                var marker = Path.Combine(workdir, ".daemon-active");
+                try { if (File.Exists(marker)) File.Delete(marker); } catch { /* ignore */ }
             }
         });
     }
