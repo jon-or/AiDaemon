@@ -94,6 +94,32 @@ public class GhClient : IGhClient
         }
     }
 
+    public async Task<IReadOnlyList<CommentInfo>> ListRecentIssueCommentsAsync(
+        string repoFullName, int number, int perPage, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(repoFullName) || number <= 0)
+            return Array.Empty<CommentInfo>();
+
+        // sort=created&direction=desc puts newest first so we can take the first N without
+        // walking pagination. per_page tracks the caller's request — typically 2 to cover
+        // "latest plus one prior" for triage context.
+        var clampedPerPage = Math.Clamp(perPage, 1, 100);
+        var path = $"/repos/{repoFullName}/issues/{number}/comments?sort=created&direction=desc&per_page={clampedPerPage}";
+
+        try
+        {
+            var result = await RunGhAsync(new[] { "api", path }, cancellationToken);
+            return Deserialize<List<CommentInfo>>(result.Stdout, path);
+        }
+        catch (GhCliException ex) when (ex.Stderr.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+        {
+            // Issue / PR deleted, or repo gone. Empty list lets the triage fall back to the
+            // single comment we already have without aborting the whole pipeline.
+            _logger.LogDebug("issue comments 404'd path={Path}", path);
+            return Array.Empty<CommentInfo>();
+        }
+    }
+
     public Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken)
         => ApiAsync<PrInfo>($"/repos/{repoFullName}/pulls/{prNumber}", cancellationToken);
 

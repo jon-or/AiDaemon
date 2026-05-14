@@ -32,4 +32,22 @@ public interface ITriagePipeline
         IReadOnlyList<NotificationWithBody> items,
         BranchInfo branch,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Best-effort fetch of the prior issue/PR conversation comment for each item, returned as
+    /// a new list with <see cref="NotificationWithBody.PriorCommentBody"/> /
+    /// <see cref="NotificationWithBody.PriorCommentAuthor"/> populated where available.
+    /// Called between branch resolve and L3 agent triage so both the classifier and the
+    /// downstream pre-run see the prior-comment context — useful when the latest comment is
+    /// a terse follow-up ("see above", "yes do that") to the one before it.
+    /// <para>
+    /// Failures (no PR/issue number on the branch, no prior comment, gh hiccup) are swallowed:
+    /// the returned item is identical to the input, with empty prior fields. The triage path
+    /// must not be brittle to comment-list outages.
+    /// </para>
+    /// </summary>
+    Task<IReadOnlyList<NotificationWithBody>> EnrichWithPriorCommentsAsync(
+        IReadOnlyList<NotificationWithBody> items,
+        BranchInfo branch,
+        CancellationToken cancellationToken);
 }

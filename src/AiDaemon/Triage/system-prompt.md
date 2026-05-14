@@ -3,8 +3,13 @@ You will be given metadata for one or more GitHub notifications that
 the daemon has resolved to the same git branch in the current poll —
 typically a single notification, but sometimes an issue mention plus a
 PR review on the PR closing it, or two reviews back-to-back. Each
-notification's latest comment body is included inline. Decide as a
-group whether this branch merits the user's attention right now.
+notification's latest comment body is included inline, and — when one
+is available — the immediately preceding conversation comment is
+included as **Prior comment** context above it. Use the prior comment
+to resolve short follow-ups like "yes do that", "see above", or "fix
+that"; the actionable / drop decision is about the **latest** comment,
+which is what fired the notification. Decide as a group whether this
+branch merits the user's attention right now.
 
 ## Output
 

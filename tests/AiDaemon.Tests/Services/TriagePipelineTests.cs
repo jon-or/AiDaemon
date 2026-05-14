@@ -411,6 +411,255 @@ public class TriagePipelineTests : IDisposable
         Assert.Contains("newer pr title", capturedUserInput);
     }
 
+    // ==================== EnrichWithPriorCommentsAsync ====================
+
+    static CommentInfo Comment(long id, string body, string author = "alice") => new()
+    {
+        Id = id,
+        Body = body,
+        User = new GhUserRef { Login = author, Type = "User" },
+    };
+
+    [Fact]
+    public async Task Enrich_NoIssueOrPrNumberOnBranch_ReturnsItemsUnchanged_NoGhCall()
+    {
+        var branch = new BranchInfo("ownerrez/orez", "stray-branch",
+            @"D:\git\orez.worktrees\stray-branch", PrNumber: null, IssueNumber: null);
+        var items = new[] { new NotificationWithBody(N(), "body") };
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(items, branch, default);
+
+        Assert.Same(items, got);
+        _gh.Verify(g => g.ListRecentIssueCommentsAsync(
+            It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Enrich_PrefersPrNumberOverIssueNumber()
+    {
+        // Branch carries both PR and issue (PR named after the issue) — listing should be
+        // against the PR's number, since that's where the active conversation lives.
+        var branch = new BranchInfo("ownerrez/orez", "16119-foo",
+            @"D:\git\orez.worktrees\16119-foo", PrNumber: 16742, IssueNumber: 16119);
+
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                "ownerrez/orez", 16742, It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Comment(2, "latest"), Comment(1, "prior", "bob") });
+
+        var items = new[]
+        {
+            new NotificationWithBody(
+                N(commentUrl: "https://api.github.com/repos/o/r/issues/comments/2"),
+                "latest", "alice"),
+        };
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(items, branch, default);
+
+        Assert.Single(got);
+        Assert.Equal("prior", got[0].PriorCommentBody);
+        Assert.Equal("bob", got[0].PriorCommentAuthor);
+        _gh.Verify(g => g.ListRecentIssueCommentsAsync(
+            "ownerrez/orez", 16742, 2, It.IsAny<CancellationToken>()), Times.Once);
+        _gh.Verify(g => g.ListRecentIssueCommentsAsync(
+            It.IsAny<string>(), 16119, It.IsAny<int>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Enrich_DedupesLatestByCommentUrlId()
+    {
+        // The listing puts the latest comment first; the latest_comment_url's trailing id
+        // identifies it so we skip it and pick the second item as the prior.
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Comment(99, "latest body"), Comment(42, "prior body", "carol") });
+
+        var item = new NotificationWithBody(
+            N(commentUrl: "https://api.github.com/repos/o/r/issues/comments/99"),
+            "latest body", "alice");
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(new[] { item }, Branch(), default);
+
+        Assert.Equal("prior body", got[0].PriorCommentBody);
+        Assert.Equal("carol", got[0].PriorCommentAuthor);
+    }
+
+    [Fact]
+    public async Task Enrich_LatestUrlNotParseable_TakesFirstListedAsPrior()
+    {
+        // PR review comments / reviews don't appear in the issues-comments endpoint, so the
+        // latest_comment_url id won't match any listed id. In that case the most-recent
+        // issue conversation comment is still useful context — take it.
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Comment(7, "recent conversation note", "dave") });
+
+        var item = new NotificationWithBody(
+            // Subject URL ends in a number but it's a review id, not in the issues listing.
+            N(commentUrl: "https://api.github.com/repos/o/r/pulls/comments/12345"),
+            "review body", "alice");
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(new[] { item }, Branch(), default);
+
+        Assert.Equal("recent conversation note", got[0].PriorCommentBody);
+        Assert.Equal("dave", got[0].PriorCommentAuthor);
+    }
+
+    [Fact]
+    public async Task Enrich_EmptyListing_LeavesPriorFieldsEmpty()
+    {
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<CommentInfo>());
+
+        var item = new NotificationWithBody(N(), "latest", "alice");
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(new[] { item }, Branch(), default);
+
+        Assert.Equal("", got[0].PriorCommentBody);
+        Assert.Equal("", got[0].PriorCommentAuthor);
+    }
+
+    [Fact]
+    public async Task Enrich_GhThrows_SwallowsAndReturnsItemsUnchanged()
+    {
+        // Triage must remain dispatchable even if the comment-list endpoint is unhappy.
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("gh hiccup"));
+
+        var item = new NotificationWithBody(N(), "latest", "alice");
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(new[] { item }, Branch(), default);
+
+        Assert.Single(got);
+        Assert.Equal("", got[0].PriorCommentBody);
+        Assert.Equal("", got[0].PriorCommentAuthor);
+    }
+
+    [Fact]
+    public async Task Enrich_OnlyOneCommentMatchesLatest_LeavesPriorEmpty()
+    {
+        // Single comment in the listing, and it matches the latest id — there's no prior.
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Comment(99, "only comment") });
+
+        var item = new NotificationWithBody(
+            N(commentUrl: "https://api.github.com/repos/o/r/issues/comments/99"),
+            "only comment", "alice");
+
+        var got = await _pipeline.EnrichWithPriorCommentsAsync(new[] { item }, Branch(), default);
+
+        Assert.Equal("", got[0].PriorCommentBody);
+    }
+
+    [Fact]
+    public async Task Enrich_OneListingPerBranch_RegardlessOfItemCount()
+    {
+        // Coalesced batches share the single API call.
+        _gh.Setup(g => g.ListRecentIssueCommentsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { Comment(2, "newest"), Comment(1, "prior", "carol") });
+
+        var items = new[]
+        {
+            new NotificationWithBody(
+                N(commentUrl: "https://api.github.com/repos/o/r/issues/comments/2"),
+                "newest", "alice"),
+            new NotificationWithBody(
+                N(commentUrl: "https://api.github.com/repos/o/r/issues/comments/2"),
+                "newest", "alice"),
+        };
+
+        await _pipeline.EnrichWithPriorCommentsAsync(items, Branch(), default);
+
+        _gh.Verify(g => g.ListRecentIssueCommentsAsync(
+            It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public void ParseCommentIdFromUrl_HandlesNormalAndDegenerateCases()
+    {
+        Assert.Equal(12345, TriagePipeline.ParseCommentIdFromUrl(
+            "https://api.github.com/repos/o/r/issues/comments/12345"));
+        Assert.Null(TriagePipeline.ParseCommentIdFromUrl(null));
+        Assert.Null(TriagePipeline.ParseCommentIdFromUrl(""));
+        Assert.Null(TriagePipeline.ParseCommentIdFromUrl("/repos/o/r/issues/comments/not-a-number"));
+        Assert.Null(TriagePipeline.ParseCommentIdFromUrl("trailing/"));
+        Assert.Equal(42, TriagePipeline.ParseCommentIdFromUrl(
+            "https://api.github.com/repos/o/r/issues/comments/42?foo=bar"));
+    }
+
+    // ==================== L3 with prior comment in input ====================
+
+    [Fact]
+    public async Task Agent_BuildAgentInput_IncludesPriorCommentLabelledAsContext()
+    {
+        // Pin BuildAgentInput's payload when a prior comment is supplied — the agent must see
+        // the prior body labelled distinctly from the latest so it can resolve short follow-ups.
+        string? capturedUserInput = null;
+        _claude.Setup(c => c.RunHeadlessJsonAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback((string _, string userInput, string _, string _, string _, TimeSpan _, CancellationToken _, string? _, string? _) =>
+                capturedUserInput = userInput)
+            .ReturnsAsync(new ClaudeJsonResult(false, "",
+                JsonSerializer.SerializeToElement(new { action = "actionable", confidence = 0.9, why = "x" }),
+                "end_turn", 100));
+
+        var item = new NotificationWithBody(N(), "LATEST-MARKER", "alice")
+        {
+            PriorCommentBody = "PRIOR-MARKER",
+            PriorCommentAuthor = "bob",
+        };
+
+        await _pipeline.AgentTriageAsync(new[] { item }, Branch(), default);
+
+        Assert.NotNull(capturedUserInput);
+        Assert.Contains("PRIOR-MARKER", capturedUserInput);
+        Assert.Contains("LATEST-MARKER", capturedUserInput);
+        Assert.Contains("Prior comment by bob", capturedUserInput);
+        Assert.Contains("Latest comment", capturedUserInput);
+        // Prior renders BEFORE latest so chronological order on screen matches the conversation.
+        var iPrior = capturedUserInput.IndexOf("PRIOR-MARKER", StringComparison.Ordinal);
+        var iLatest = capturedUserInput.IndexOf("LATEST-MARKER", StringComparison.Ordinal);
+        Assert.True(iPrior < iLatest, "prior comment should render before latest in BuildAgentInput");
+    }
+
+    [Fact]
+    public async Task Agent_BuildAgentInput_NoPriorComment_OmitsLatestHeading()
+    {
+        // Without a prior comment we keep the original format — no "Latest comment" heading,
+        // just the bare fenced block. (Avoids gratuitous noise for the common case.)
+        string? capturedUserInput = null;
+        _claude.Setup(c => c.RunHeadlessJsonAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>(),
+                It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback((string _, string userInput, string _, string _, string _, TimeSpan _, CancellationToken _, string? _, string? _) =>
+                capturedUserInput = userInput)
+            .ReturnsAsync(new ClaudeJsonResult(false, "",
+                JsonSerializer.SerializeToElement(new { action = "actionable", confidence = 0.9, why = "x" }),
+                "end_turn", 100));
+
+        await _pipeline.AgentTriageAsync(
+            new[] { new NotificationWithBody(N(), "BARE-BODY", "alice") },
+            Branch(), default);
+
+        Assert.NotNull(capturedUserInput);
+        Assert.Contains("BARE-BODY", capturedUserInput);
+        Assert.DoesNotContain("Prior comment", capturedUserInput);
+        // "Latest comment URL:" is a per-notification metadata line and unrelated to the
+        // body-heading we're testing. The heading itself is "Latest comment (the one that
+        // fired this notification)" — pin that exact phrase.
+        Assert.DoesNotContain("Latest comment (the one", capturedUserInput);
+    }
+
     [Fact]
     public async Task Agent_NoStructuredOutput_FallsBackToActionable()
     {

@@ -113,6 +113,78 @@ public class GhClientTests
         Assert.DoesNotContain(calls[0], a => a.Contains("api.github.com"));
     }
 
+    // ---------- ListRecentIssueCommentsAsync ----------
+
+    [Fact]
+    public async Task ListRecentIssueComments_BuildsDescSortedQuery_WithPerPage()
+    {
+        CaptureGhArgs(out var calls,
+            stdout: """[{"id":2,"body":"newest","user":{"login":"alice","type":"User"}},{"id":1,"body":"older","user":{"login":"bob","type":"User"}}]""");
+
+        var got = await Build().ListRecentIssueCommentsAsync(
+            "ownerrez/orez", number: 16119, perPage: 2, default);
+
+        Assert.Equal(2, got.Count);
+        Assert.Equal(2, got[0].Id);
+        Assert.Equal("newest", got[0].Body);
+        Assert.Equal(1, got[1].Id);
+        Assert.Equal("older", got[1].Body);
+
+        // Path shape: /repos/<repo>/issues/<n>/comments?sort=created&direction=desc&per_page=N
+        Assert.Single(calls);
+        Assert.Equal("api", calls[0][0]);
+        var path = calls[0][1];
+        Assert.StartsWith("/repos/ownerrez/orez/issues/16119/comments?", path);
+        Assert.Contains("sort=created", path);
+        Assert.Contains("direction=desc", path);
+        Assert.Contains("per_page=2", path);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public async Task ListRecentIssueComments_NonPositiveNumber_ReturnsEmpty_NoGhCall(int number)
+    {
+        // Strict runner: an unstubbed gh call would throw.
+        var got = await Build().ListRecentIssueCommentsAsync("ownerrez/orez", number, perPage: 2, default);
+        Assert.Empty(got);
+        _runner.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ListRecentIssueComments_EmptyRepo_ReturnsEmpty_NoGhCall()
+    {
+        var got = await Build().ListRecentIssueCommentsAsync("", number: 1, perPage: 2, default);
+        Assert.Empty(got);
+        _runner.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ListRecentIssueComments_404_ReturnsEmptyInsteadOfThrowing()
+    {
+        // Triage must keep working even if the issue/PR is gone — we just lose the prior
+        // comment for this round and fall back to the single latest body.
+        StubGh("", exitCode: 1, stderr: "gh: HTTP 404: Not Found");
+        var got = await Build().ListRecentIssueCommentsAsync("ownerrez/orez", 16119, perPage: 2, default);
+        Assert.Empty(got);
+    }
+
+    [Fact]
+    public async Task ListRecentIssueComments_ClampsPerPage_AboveOneHundred()
+    {
+        CaptureGhArgs(out var calls, stdout: "[]");
+        await Build().ListRecentIssueCommentsAsync("ownerrez/orez", 1, perPage: 500, default);
+        Assert.Contains("per_page=100", calls[0][1]);
+    }
+
+    [Fact]
+    public async Task ListRecentIssueComments_ClampsPerPage_BelowOne()
+    {
+        CaptureGhArgs(out var calls, stdout: "[]");
+        await Build().ListRecentIssueCommentsAsync("ownerrez/orez", 1, perPage: 0, default);
+        Assert.Contains("per_page=1", calls[0][1]);
+    }
+
     // ---------- ListNotificationsAsync URL shape ----------
 
     [Fact]

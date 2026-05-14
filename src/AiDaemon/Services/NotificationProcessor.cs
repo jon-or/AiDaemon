@@ -93,8 +93,19 @@ public class NotificationProcessor : INotificationProcessor
             return RetryOutcome.Unresolved;
         }
 
-        // ---- L3 agent triage on a one-item batch ----
-        var items = new List<NotificationWithBody>(1) { new(n, commentBody, commentAuthor) };
+        // ---- Prior-comment enrichment + L3 agent triage on a one-item batch ----
+        // Enrichment is best-effort: the pipeline swallows gh failures and any unexpected
+        // escape here falls back to the un-enriched item. Triage must not be brittle to
+        // the comment-list endpoint being unavailable.
+        IReadOnlyList<NotificationWithBody> items = [new NotificationWithBody(n, commentBody, commentAuthor)];
+        try
+        {
+            items = await _triage.EnrichWithPriorCommentsAsync(items, branch, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "retry prior-comment enrichment threw branch={Branch} — proceeding without", branch.Key);
+        }
 
         TriageVerdict verdict;
         try

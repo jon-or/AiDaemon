@@ -150,6 +150,8 @@ public class AgentPreRunner : IAgentPreRunner
             var n = ordered[i].Notification;
             var body = ordered[i].CommentBody;
             var author = ordered[i].CommentAuthor;
+            var priorBody = ordered[i].PriorCommentBody;
+            var priorAuthor = ordered[i].PriorCommentAuthor;
 
             sb.AppendLine();
             sb.AppendLine($"### {i + 1}. {n.Subject.Type} — reason `{n.Reason}` — {n.UpdatedAt:O}");
@@ -160,9 +162,24 @@ public class AgentPreRunner : IAgentPreRunner
             if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
                 sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
 
+            // The pre-run gets the prior conversation comment as context. The pre-run agent's
+            // job is to credit the *latest* commenter (the requester named above) — the prior
+            // comment is reference material when the latest comment refers back to it.
+            if (!string.IsNullOrEmpty(priorBody))
+            {
+                sb.AppendLine();
+                var who = string.IsNullOrEmpty(priorAuthor) ? "" : $" by {priorAuthor}";
+                sb.AppendLine($"#### Prior comment{who} (context — not what fired this notification)");
+                sb.AppendLine("```");
+                sb.AppendLine(priorBody);
+                sb.AppendLine("```");
+            }
+
             if (!string.IsNullOrEmpty(body))
             {
                 sb.AppendLine();
+                if (!string.IsNullOrEmpty(priorBody))
+                    sb.AppendLine("#### Latest comment (the one that fired this notification)");
                 sb.AppendLine("```");
                 sb.AppendLine(body);
                 sb.AppendLine("```");

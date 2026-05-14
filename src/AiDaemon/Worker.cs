@@ -383,11 +383,31 @@ public class Worker : BackgroundService
         // ============================================================================
         foreach (var (branchKey, batch) in byBranch)
         {
+            // ---------- Prior-comment enrichment ----------
+            // Done once per branch (not per notification) so a coalesced batch shares the
+            // single gh listing. The L3 classifier and the downstream pre-run both see the
+            // prior conversation comment; the dispatcher receives the enriched items so the
+            // pre-run input is built from the same data.
+            IReadOnlyList<NotificationWithBody> enrichedItems;
+            try
+            {
+                enrichedItems = await _triage.EnrichWithPriorCommentsAsync(batch.Items, batch.Branch, cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Enrichment is best-effort and the pipeline itself already swallows gh
+                // failures. Any escape here is unexpected, but we don't want a triage failure
+                // just because we couldn't fetch the prior comment. Fall back to the original
+                // items and continue.
+                _logger.LogWarning(ex, "prior-comment enrichment threw branch={Branch} — proceeding without", branchKey);
+                enrichedItems = batch.Items;
+            }
+
             // ---------- L3 agent triage in scratch ----------
             TriageVerdict verdict;
             try
             {
-                verdict = await _triage.AgentTriageAsync(batch.Items, batch.Branch, cancellationToken);
+                verdict = await _triage.AgentTriageAsync(enrichedItems, batch.Branch, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -418,7 +438,9 @@ public class Worker : BackgroundService
             DispatchOutcome dispatchOutcome;
             try
             {
-                dispatchOutcome = await _dispatcher.DispatchAsync(batch.Branch, batch.Items, verdict, cancellationToken);
+                // Pass the enriched items so the pre-run agent (run inside DispatchAsync) sees
+                // the prior-comment context the L3 classifier already saw.
+                dispatchOutcome = await _dispatcher.DispatchAsync(batch.Branch, enrichedItems, verdict, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {

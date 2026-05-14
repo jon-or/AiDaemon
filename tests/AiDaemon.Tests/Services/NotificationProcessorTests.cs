@@ -23,6 +23,20 @@ public class NotificationProcessorTests
     readonly Mock<IBranchResolver> _resolver = new(MockBehavior.Strict);
     readonly Mock<IDispatcher> _dispatcher = new(MockBehavior.Strict);
 
+    public NotificationProcessorTests()
+    {
+        // Prior-comment enrichment is a best-effort step between branch-resolve and L3.
+        // The behavior itself is exercised in TriagePipelineTests; here we just need the
+        // strict-mode call to succeed when the test path reaches L3. Default: passthrough.
+        // Registered in the constructor (not Build()) so individual tests can override it
+        // and the override doesn't get clobbered when Build() re-registers later.
+        _triage.Setup(t => t.EnrichWithPriorCommentsAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) => items);
+    }
+
     NotificationProcessor Build() => new(
         _store.Object,
         _triage.Object,

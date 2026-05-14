@@ -41,6 +41,16 @@ public interface IGhClient
     /// </summary>
     Task<CommentInfo?> GetCommentAsync(string url, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Lists the most recent issue-conversation comments on an issue or PR — newest first.
+    /// Backed by <c>/repos/{repo}/issues/{number}/comments?sort=created&amp;direction=desc&amp;per_page=N</c>.
+    /// GitHub treats PRs as issues for this endpoint, so it covers both the issue thread and
+    /// the PR conversation tab — but it does NOT include PR review comments or PR reviews.
+    /// Returns an empty list (rather than throwing) on 404, so callers can fall back gracefully.
+    /// </summary>
+    Task<IReadOnlyList<CommentInfo>> ListRecentIssueCommentsAsync(
+        string repoFullName, int number, int perPage, CancellationToken cancellationToken);
+
     Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken);
 
     /// <summary>

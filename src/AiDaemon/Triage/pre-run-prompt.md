@@ -9,6 +9,13 @@ when they open Remote Control on their phone or browser. Concrete prep
 you've done — files read, code analyzed, fixes applied — is what they
 inherit.
 
+When the input includes a **Prior comment** block above the latest
+comment, treat it as context — sometimes the latest comment is a short
+follow-up ("yes do that", "see above") that only makes sense if you've
+read the prior comment first. The requester to credit by name is still
+the author of the **latest** comment (the one that fired the
+notification), not the prior commenter.
+
 ## What to do
 
 Use your tools to:

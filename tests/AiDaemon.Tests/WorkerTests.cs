@@ -34,14 +34,30 @@ public class WorkerTests
         RepoAllowlist = new() { "ownerrez/orez" },
     };
 
-    Worker Build()
+    public WorkerTests()
     {
+        // Defaults must register *before* per-test overrides so individual tests can replace
+        // them. (Moq is last-write-wins, so anything wired inside Build() would clobber a
+        // test-level override that ran first.)
+
         // Daily processed-prune gate: every TickAsync call reads the last-pruned kv and either
         // skips or runs PruneProcessedAsync. Default to "already pruned recently" so individual
         // tests don't have to wire it; the prune behavior itself has its own focused tests.
         _store.Setup(s => s.GetKvAsync(StateStoreKeys.ProcessedLastPruned, It.IsAny<CancellationToken>()))
             .ReturnsAsync(DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture));
 
+        // Prior-comment enrichment is a best-effort step between branch-resolve and L3 in the
+        // tick. The behavior is exercised in TriagePipelineTests; here we just need the
+        // strict-mode call to succeed. Default: passthrough.
+        _triage.Setup(t => t.EnrichWithPriorCommentsAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) => items);
+    }
+
+    Worker Build()
+    {
         return new Worker(
             NullLogger<Worker>.Instance,
             Options.Create(_options),
@@ -165,6 +181,124 @@ public class WorkerTests
         // Rate limit charged once per unique thread on dispatch — not per L1 entry.
         _store.Verify(s => s.IncrementRateLimitAsync("thread-A", It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()), Times.Once);
         _store.Verify(s => s.IncrementRateLimitAsync("thread-B", It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Tick_EnrichesPriorCommentsOncePerBranch_AndPassesEnrichedItemsToDispatch()
+    {
+        // Two notifications on the same branch coalesce — enrichment must run exactly once
+        // for the branch (not per notification), and the enriched items must be what gets
+        // passed downstream to AgentTriage AND DispatchAsync (so the pre-run sees the prior
+        // comment too).
+        var n1 = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        var n2 = N("thread-B", "https://api.github.com/repos/o/r/issues/comments/2");
+        StubPoller(n1, n2);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+
+        // Override the default passthrough: stamp every item with a marker prior body so
+        // we can assert the enriched objects (not the raw ones) flow to dispatch.
+        _triage.Setup(t => t.EnrichWithPriorCommentsAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) =>
+                items.Select(i => i with { PriorCommentBody = "PRIOR", PriorCommentAuthor = "bob" }).ToList());
+
+        IReadOnlyList<NotificationWithBody>? agentItems = null;
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) =>
+                agentItems = items)
+            .ReturnsAsync(TriageVerdict.Actionable("go", "x", 0.9));
+
+        IReadOnlyList<NotificationWithBody>? dispatchedItems = null;
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((BranchInfo _, IReadOnlyList<NotificationWithBody> items, TriageVerdict _, CancellationToken _) =>
+                dispatchedItems = items)
+            .ReturnsAsync(DispatchOutcome.Spawned);
+
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(s => s.IncrementRateLimitAsync(
+                It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        await Build().TickAsync(default);
+
+        // Exactly one enrichment call for the branch — coalesced notifications share it.
+        _triage.Verify(t => t.EnrichWithPriorCommentsAsync(
+            It.Is<IReadOnlyList<NotificationWithBody>>(x => x.Count == 2),
+            It.IsAny<BranchInfo>(),
+            It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        // Both the classifier AND the dispatcher (which feeds the pre-run) see the enriched
+        // items — not the raw items.
+        Assert.NotNull(agentItems);
+        Assert.All(agentItems!, i => Assert.Equal("PRIOR", i.PriorCommentBody));
+        Assert.NotNull(dispatchedItems);
+        Assert.All(dispatchedItems!, i => Assert.Equal("PRIOR", i.PriorCommentBody));
+    }
+
+    [Fact]
+    public async Task Tick_EnrichmentThrows_FallsBackToOriginalItemsAndContinues()
+    {
+        // A pathological exception from the enrichment helper must not block the tick — we
+        // fall back to the raw items and proceed straight to L3.
+        var n = N("thread-A", "https://api.github.com/repos/o/r/issues/comments/1");
+        StubPoller(n);
+
+        _triage.Setup(t => t.QuickTriageAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(((TriageVerdict?)null, "body", "alice"));
+        _resolver.Setup(r => r.ResolveAsync(It.IsAny<GhNotification>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(SameBranch());
+
+        // Override the default passthrough with a thrown exception.
+        _triage.Setup(t => t.EnrichWithPriorCommentsAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("synthetic"));
+
+        IReadOnlyList<NotificationWithBody>? agentItems = null;
+        _triage.Setup(t => t.AgentTriageAsync(
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<BranchInfo>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((IReadOnlyList<NotificationWithBody> items, BranchInfo _, CancellationToken _) =>
+                agentItems = items)
+            .ReturnsAsync(TriageVerdict.Actionable("go", "x", 0.9));
+
+        _dispatcher.Setup(d => d.DispatchAsync(
+                It.IsAny<BranchInfo>(),
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DispatchOutcome.Spawned);
+        _store.Setup(s => s.MarkProcessedAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ProcessedContext?>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(s => s.IncrementRateLimitAsync(
+                It.IsAny<string>(), It.IsAny<DateOnly>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        await Build().TickAsync(default);
+
+        // Triage still ran with the raw (un-enriched) item — empty prior fields.
+        Assert.NotNull(agentItems);
+        Assert.Single(agentItems!);
+        Assert.Equal("", agentItems![0].PriorCommentBody);
     }
 
     [Fact]

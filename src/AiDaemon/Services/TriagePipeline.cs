@@ -114,6 +114,79 @@ public class TriagePipeline : ITriagePipeline
         return (null, body, author);
     }
 
+    public async Task<IReadOnlyList<NotificationWithBody>> EnrichWithPriorCommentsAsync(
+        IReadOnlyList<NotificationWithBody> items, BranchInfo branch, CancellationToken cancellationToken)
+    {
+        // Branch number drives the listing. PRs are issues for the comments endpoint, so PrNumber
+        // is preferred (it points at the active conversation); IssueNumber is the fallback for
+        // issue-only branches. With neither, we skip — there's no way to list anything.
+        var number = branch.PrNumber ?? branch.IssueNumber;
+        if (number is null || number <= 0)
+            return items;
+
+        // One listing per branch, regardless of how many notifications coalesced onto it. Two
+        // newest comments are enough: each item drops its own latest from the dedupe and keeps
+        // whatever remains as the prior. If both items in a batch happen to share the same
+        // latest_comment_url, they share the same prior — that's fine.
+        IReadOnlyList<CommentInfo> recent;
+        try
+        {
+            recent = await _gh.ListRecentIssueCommentsAsync(branch.Repo, number.Value, perPage: 2, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex,
+                "prior-comment fetch failed branch={Branch} number={Number} — proceeding without",
+                branch.Key, number);
+            return items;
+        }
+
+        if (recent.Count == 0)
+            return items;
+
+        var enriched = new List<NotificationWithBody>(items.Count);
+        foreach (var item in items)
+        {
+            // The latest_comment_url's id identifies which comment in the listing is "the
+            // latest" so we can pick the one *before* it. If the URL isn't parseable (PR review
+            // comment / review URL — different endpoints), we still have the most-recent issue
+            // comment in `recent[0]` as useful context; take it as the prior since we know it
+            // isn't the one that fired the notification.
+            var latestId = ParseCommentIdFromUrl(item.Notification.Subject.LatestCommentUrl);
+            var prior = recent.FirstOrDefault(c => latestId is null || c.Id != latestId.Value);
+            if (prior is null)
+            {
+                enriched.Add(item);
+                continue;
+            }
+
+            enriched.Add(item with
+            {
+                PriorCommentBody = prior.Body ?? "",
+                PriorCommentAuthor = prior.User?.Login ?? "",
+            });
+        }
+
+        return enriched;
+    }
+
+    /// <summary>
+    /// Pulls the trailing numeric segment out of a GitHub comment URL
+    /// (<c>https://api.github.com/repos/o/r/issues/comments/12345</c>). Returns <c>null</c>
+    /// for URLs that don't end in a number (subject URLs, malformed input, etc.).
+    /// </summary>
+    internal static long? ParseCommentIdFromUrl(string? url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
+        var slash = url.LastIndexOf('/');
+        if (slash < 0 || slash == url.Length - 1) return null;
+        var tail = url.AsSpan(slash + 1);
+        // Trim any query string (?foo=bar) — gh URLs don't carry one today, but defensive.
+        var q = tail.IndexOf('?');
+        if (q >= 0) tail = tail[..q];
+        return long.TryParse(tail, out var id) ? id : null;
+    }
+
     public async Task<TriageVerdict> AgentTriageAsync(IReadOnlyList<NotificationWithBody> items, BranchInfo branch, CancellationToken cancellationToken)
     {
         if (items.Count == 0)
@@ -218,6 +291,8 @@ public class TriagePipeline : ITriagePipeline
         {
             var n = ordered[i].Notification;
             var body = ordered[i].CommentBody;
+            var priorBody = ordered[i].PriorCommentBody;
+            var priorAuthor = ordered[i].PriorCommentAuthor;
 
             sb.AppendLine();
             sb.AppendLine($"### {i + 1}. {n.Subject.Type} — reason `{n.Reason}` — {n.UpdatedAt:O}");
@@ -225,9 +300,27 @@ public class TriagePipeline : ITriagePipeline
             if (!string.IsNullOrEmpty(n.Subject.LatestCommentUrl))
                 sb.AppendLine($"- Latest comment URL: {n.Subject.LatestCommentUrl}");
 
+            // Prior comment renders BEFORE the latest so chronological order on screen matches
+            // the conversation. Labelled distinctly so the classifier can tell the two apart
+            // — the latest comment is the one that fired the notification; the prior is
+            // context, sometimes referenced by the latest ("see above", "yes do that").
+            if (!string.IsNullOrEmpty(priorBody))
+            {
+                sb.AppendLine();
+                var who = string.IsNullOrEmpty(priorAuthor) ? "" : $" by {priorAuthor}";
+                sb.AppendLine($"#### Prior comment{who} (context — not what fired this notification)");
+                sb.AppendLine("```");
+                sb.AppendLine(priorBody);
+                sb.AppendLine("```");
+            }
+
             if (!string.IsNullOrEmpty(body))
             {
                 sb.AppendLine();
+                // Only label "Latest comment" when there's a prior comment to disambiguate
+                // it from — otherwise the format stays identical to the pre-enrichment shape.
+                if (!string.IsNullOrEmpty(priorBody))
+                    sb.AppendLine("#### Latest comment (the one that fired this notification)");
                 sb.AppendLine("```");
                 sb.AppendLine(body);
                 sb.AppendLine("```");

@@ -14,4 +14,18 @@ namespace AiDaemon.Models;
 public record NotificationWithBody(
     GhNotification Notification,
     string CommentBody,
-    string CommentAuthor = "");
+    string CommentAuthor = "")
+{
+    /// <summary>
+    /// Body of the issue/PR conversation comment that came immediately before
+    /// <see cref="CommentBody"/>, or empty when none was fetched (no prior comment, fetch
+    /// failed, or the notification didn't surface an issue/PR number). Triage and the
+    /// pre-run agent get this so they can resolve a latest comment that references the one
+    /// before it ("see above", "as I said earlier", short follow-ups, etc.) without needing
+    /// to spend a tool call to fetch it themselves.
+    /// </summary>
+    public string PriorCommentBody { get; init; } = "";
+
+    /// <summary>GitHub login of whoever posted <see cref="PriorCommentBody"/>, or empty when none.</summary>
+    public string PriorCommentAuthor { get; init; } = "";
+}
