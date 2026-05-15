@@ -51,6 +51,17 @@ public interface IGhClient
     Task<IReadOnlyList<CommentInfo>> ListRecentIssueCommentsAsync(
         string repoFullName, int number, int perPage, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Lists PR reviews from <c>/repos/{repo}/pulls/{n}/reviews</c>, sorted newest-first.
+    /// The endpoint itself doesn't accept sort params and returns oldest-first; this helper
+    /// reverses client-side. Used by L1.5 triage to recover a "what fired this notification"
+    /// body when a PR notification has no <c>latest_comment_url</c> — the trigger was usually
+    /// a review submit (approve / request-changes / comment-with-body), which doesn't surface
+    /// as a comment. Returns an empty list on 404.
+    /// </summary>
+    Task<IReadOnlyList<ReviewInfo>> ListRecentPullRequestReviewsAsync(
+        string repoFullName, int prNumber, CancellationToken cancellationToken);
+
     Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken);
 
     /// <summary>

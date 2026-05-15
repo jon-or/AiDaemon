@@ -81,6 +81,15 @@ public class TriageOptions
 
     public int MaxActionsPerThreadPerDay { get; set; } = 5;
     public List<string> L2DropPatterns { get; set; } = new();
+
+    /// <summary>
+    /// When true (default), PR notifications fired by a pure approval (review state=APPROVED
+    /// with empty body) drop at L1.5 instead of being sent to the LLM. The classifier was
+    /// already getting these right ~all the time, but each one costs an LLM call for no
+    /// value — the daemon's not going to "respond" to a thumbs-up. Set to false to route
+    /// approvals through the agent anyway (debugging, audit-mode).
+    /// </summary>
+    public bool DropEmptyApprovals { get; set; } = true;
 }
 
 public class NtfyOptions

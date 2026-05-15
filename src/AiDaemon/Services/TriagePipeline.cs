@@ -27,6 +27,15 @@ public class TriagePipeline : ITriagePipeline
     /// </summary>
     static readonly TimeSpan L3Timeout = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// Max gap between a notification's <c>updated_at</c> and a PR review's <c>submitted_at</c>
+    /// for that review to be treated as the trigger. GitHub assembles notification rows on its
+    /// side a beat after the underlying event, so a few seconds is normal; two minutes is
+    /// generous enough to absorb clock skew + ingest lag without picking up an unrelated
+    /// earlier review on the same PR.
+    /// </summary>
+    static readonly TimeSpan ReviewMatchTolerance = TimeSpan.FromMinutes(2);
+
     readonly IGhClient _gh;
     readonly IClaudeRunner _claude;
     readonly IStateStore _store;
@@ -88,12 +97,29 @@ public class TriagePipeline : ITriagePipeline
         // L1 author check requires the comment body. Fetch once; the body + author are
         // also returned so callers can pass them through to the agent without re-fetching
         // (and so the pre-run can credit the requester by name in its summary).
-        CommentInfo? comment = null;
+        string author = "";
+        string body = "";
         if (!string.IsNullOrWhiteSpace(n.Subject.LatestCommentUrl))
-            comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl!, cancellationToken);
-
-        var author = comment?.User.Login ?? "";
-        var body = comment?.Body ?? "";
+        {
+            var comment = await _gh.GetCommentAsync(n.Subject.LatestCommentUrl, cancellationToken);
+            author = comment?.User.Login ?? "";
+            body = comment?.Body ?? "";
+        }
+        else if (string.Equals(n.Subject.Type, "PullRequest", StringComparison.OrdinalIgnoreCase))
+        {
+            // L1.5: PR notification with no latest_comment_url. The trigger is a PR-level
+            // event — almost always a review submission (approved / changes-requested / a
+            // review with a top-level body) which doesn't show up as a "comment" in the
+            // notification subject. Fetch reviews and find the one whose submitted_at is
+            // near the notification's updated_at; treat its body+author as if it were the
+            // comment. If we can't find a recent matching review, body/author stay empty
+            // and the LLM gets metadata only (same as today).
+            var (revBody, revAuthor, emptyApproval) = await TryGetTriggerReviewAsync(n, cancellationToken);
+            body = revBody;
+            author = revAuthor;
+            if (emptyApproval && _options.Triage.DropEmptyApprovals)
+                return (TriageVerdict.Drop($"empty PR approval by {author}"), body, author);
+        }
 
         if (!string.IsNullOrEmpty(_options.AiUserLogin) &&
             string.Equals(author, _options.AiUserLogin, StringComparison.OrdinalIgnoreCase))
@@ -112,6 +138,62 @@ public class TriagePipeline : ITriagePipeline
 
         // Defer to agent triage.
         return (null, body, author);
+    }
+
+    /// <summary>
+    /// For a PR notification with no <c>latest_comment_url</c>, look at the PR's reviews and
+    /// pick the one closest in time to <c>n.UpdatedAt</c> (within <see cref="ReviewMatchTolerance"/>).
+    /// That review almost certainly fired this notification. Returns its body+author so the
+    /// rest of triage can act on it, plus a flag set when the review is an empty approval
+    /// (the case the caller can short-circuit-drop).
+    /// </summary>
+    async Task<(string Body, string Author, bool EmptyApproval)> TryGetTriggerReviewAsync(
+        GhNotification n, CancellationToken cancellationToken)
+    {
+        var prNumber = ParseTrailingIdFromUrl(n.Subject.Url);
+        if (prNumber is null || prNumber.Value <= 0 || prNumber.Value > int.MaxValue)
+            return ("", "", false);
+
+        IReadOnlyList<ReviewInfo> reviews;
+        try
+        {
+            reviews = await _gh.ListRecentPullRequestReviewsAsync(
+                n.Repository.FullName, (int)prNumber.Value, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex,
+                "PR reviews fetch failed thread={ThreadId} repo={Repo} pr={Pr} — proceeding without",
+                n.Id, n.Repository.FullName, prNumber);
+            return ("", "", false);
+        }
+
+        // Reviews come back newest-first from the client. Pick the one closest in time to
+        // n.UpdatedAt; if the gap exceeds tolerance, this notification was fired by something
+        // else (push, label, merge) — leave body/author empty and let L3 see metadata only.
+        ReviewInfo? best = null;
+        var bestGap = TimeSpan.MaxValue;
+        foreach (var r in reviews)
+        {
+            if (!r.SubmittedAt.HasValue) continue;
+            var gap = (r.SubmittedAt.Value - n.UpdatedAt).Duration();
+            if (gap < bestGap)
+            {
+                bestGap = gap;
+                best = r;
+            }
+        }
+
+        if (best is null || bestGap > ReviewMatchTolerance)
+            return ("", "", false);
+
+        var revAuthor = best.User?.Login ?? "";
+        var revBody = best.Body ?? "";
+        var isEmptyApproval =
+            string.Equals(best.State, "APPROVED", StringComparison.OrdinalIgnoreCase)
+            && string.IsNullOrWhiteSpace(revBody);
+
+        return (revBody, revAuthor, isEmptyApproval);
     }
 
     public async Task<IReadOnlyList<NotificationWithBody>> EnrichWithPriorCommentsAsync(
@@ -152,7 +234,7 @@ public class TriagePipeline : ITriagePipeline
             // comment / review URL — different endpoints), we still have the most-recent issue
             // comment in `recent[0]` as useful context; take it as the prior since we know it
             // isn't the one that fired the notification.
-            var latestId = ParseCommentIdFromUrl(item.Notification.Subject.LatestCommentUrl);
+            var latestId = ParseTrailingIdFromUrl(item.Notification.Subject.LatestCommentUrl);
             var prior = recent.FirstOrDefault(c => latestId is null || c.Id != latestId.Value);
             if (prior is null)
             {
@@ -171,11 +253,11 @@ public class TriagePipeline : ITriagePipeline
     }
 
     /// <summary>
-    /// Pulls the trailing numeric segment out of a GitHub comment URL
-    /// (<c>https://api.github.com/repos/o/r/issues/comments/12345</c>). Returns <c>null</c>
-    /// for URLs that don't end in a number (subject URLs, malformed input, etc.).
+    /// Pulls the trailing numeric segment out of a GitHub API URL — comment ids on
+    /// <c>/issues/comments/{id}</c>, PR / issue numbers on <c>/pulls/{n}</c> or <c>/issues/{n}</c>.
+    /// Returns <c>null</c> for URLs that don't end in a number (malformed input, trailing slash).
     /// </summary>
-    internal static long? ParseCommentIdFromUrl(string? url)
+    internal static long? ParseTrailingIdFromUrl(string? url)
     {
         if (string.IsNullOrEmpty(url)) return null;
         var slash = url.LastIndexOf('/');

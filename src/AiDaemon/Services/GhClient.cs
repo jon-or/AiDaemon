@@ -120,6 +120,33 @@ public class GhClient : IGhClient
         }
     }
 
+    public async Task<IReadOnlyList<ReviewInfo>> ListRecentPullRequestReviewsAsync(
+        string repoFullName, int prNumber, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(repoFullName) || prNumber <= 0)
+            return Array.Empty<ReviewInfo>();
+
+        // GitHub's reviews endpoint takes no sort/direction params and returns oldest-first.
+        // per_page=100 (the max) gives us the full review history in one call for the
+        // overwhelming majority of PRs; if a PR somehow accumulates 100+ reviews we'd miss the
+        // newest ones, which is rare enough to ignore. Caller sorts by submitted_at desc.
+        var path = $"/repos/{repoFullName}/pulls/{prNumber}/reviews?per_page=100";
+
+        try
+        {
+            var result = await RunGhAsync(new[] { "api", path }, cancellationToken);
+            var all = Deserialize<List<ReviewInfo>>(result.Stdout, path);
+            // Newest-first. Reviews with null SubmittedAt (state=PENDING) sort to the end.
+            all.Sort((a, b) => Nullable.Compare(b.SubmittedAt, a.SubmittedAt));
+            return all;
+        }
+        catch (GhCliException ex) when (ex.Stderr.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogDebug("PR reviews 404'd path={Path}", path);
+            return Array.Empty<ReviewInfo>();
+        }
+    }
+
     public Task<PrInfo> GetPullRequestAsync(string repoFullName, int prNumber, CancellationToken cancellationToken)
         => ApiAsync<PrInfo>($"/repos/{repoFullName}/pulls/{prNumber}", cancellationToken);
 

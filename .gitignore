@@ -16,3 +16,4 @@ appsettings.Local.json
 # OS
 Thumbs.db
 .DS_Store
+*.lscache

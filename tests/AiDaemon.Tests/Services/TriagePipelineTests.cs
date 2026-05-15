@@ -84,6 +84,44 @@ public class TriagePipelineTests : IDisposable
             });
     }
 
+    /// <summary>
+    /// Builds a no-comment-url PullRequest notification — the shape GitHub returns when the
+    /// trigger was a PR review submit (APPROVED, CHANGES_REQUESTED, COMMENTED-with-body) or
+    /// any PR-level event that doesn't surface as a comment.
+    /// </summary>
+    static GhNotification PrEvent(string updatedAt = "2026-05-15T17:07:58Z", int prNumber = 16790)
+        => new()
+        {
+            Id = "thread-pr",
+            Reason = "author",
+            UpdatedAt = DateTimeOffset.Parse(updatedAt),
+            Repository = new GhRepositoryRef { FullName = "ownerrez/orez" },
+            Subject = new GhNotificationSubject
+            {
+                Title = "Some PR",
+                Type = "PullRequest",
+                Url = $"https://api.github.com/repos/ownerrez/orez/pulls/{prNumber}",
+                LatestCommentUrl = null,
+            },
+        };
+
+    void StubReviews(params ReviewInfo[] reviews)
+    {
+        _gh.Setup(g => g.ListRecentPullRequestReviewsAsync(
+                It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(reviews);
+    }
+
+    static ReviewInfo Review(string state, string submittedAt, string user = "alice", string body = "")
+        => new()
+        {
+            Id = 1,
+            State = state,
+            Body = body,
+            User = new GhUserRef { Login = user, Type = "User" },
+            SubmittedAt = DateTimeOffset.Parse(submittedAt),
+        };
+
     void StubAgent(string action, double confidence, string why = "test")
     {
         var json = JsonSerializer.SerializeToElement(new
@@ -244,6 +282,129 @@ public class TriagePipelineTests : IDisposable
     {
         var input = "> quoted\r\n\r\nactual";
         Assert.Equal("actual", TriagePipeline.StripQuotedReplies(input));
+    }
+
+    // ==================== L1.5: PR review fallback (no latest_comment_url) ====================
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_DropsEmptyApproval()
+    {
+        // The canonical case the user wanted handled: PR author gets pinged because someone
+        // approved their PR with no review body. Today this slipped through L1 (reason=author
+        // is in the allowlist) and reached the LLM with empty body — pure waste.
+        StubReviews(Review("APPROVED", "2026-05-15T17:07:37Z", user: "eesquibel"));
+
+        var (v, _, author) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
+        Assert.Contains("empty PR approval", v.Why);
+        Assert.Equal("eesquibel", author);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_ApprovalWithBody_FallsThroughToL3()
+    {
+        // An approval with a "lgtm — nice cleanup" style body shouldn't be auto-dropped here;
+        // we let L2 / L3 decide. Body must propagate through so the classifier can read it.
+        StubReviews(Review("APPROVED", "2026-05-15T17:07:37Z",
+            user: "eesquibel", body: "nice cleanup, ship it"));
+
+        var (v, body, author) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.Null(v);  // no L1/L2 verdict → defer to agent
+        Assert.Equal("nice cleanup, ship it", body);
+        Assert.Equal("eesquibel", author);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_ChangesRequestedEmpty_NotDropped()
+    {
+        // Only empty APPROVED drops at L1.5. An empty CHANGES_REQUESTED might still be
+        // followed by line-level review comments that the agent needs to look at — defer.
+        StubReviews(Review("CHANGES_REQUESTED", "2026-05-15T17:07:37Z", user: "eesquibel"));
+
+        var (v, _, _) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.Null(v);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_BotReviewer_DropsAtAuthorCheck()
+    {
+        // Same L1.5 review-as-comment path; the bot-author check downstream sees the review's
+        // author and drops accordingly. Guards against the empty-approval rule "winning"
+        // over the bot-blocklist drop and producing a less-informative `why`.
+        StubReviews(Review("COMMENTED", "2026-05-15T17:07:37Z",
+            user: "dependabot[bot]", body: "automated note"));
+
+        var (v, _, _) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.NotNull(v);
+        Assert.Equal(TriageAction.Drop, v!.Action);
+        Assert.Contains("blocklisted bot author", v.Why);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_NoRecentReview_LeavesBodyEmpty()
+    {
+        // PR event with no review within the match tolerance — must be a push / label / merge.
+        // Body stays empty so L3 sees metadata only (same as before this change). Specifically
+        // NOT dropped, because we can't tell from here that the event is non-actionable.
+        StubReviews(Review("COMMENTED", "2026-05-12T17:31:00Z"));  // 3 days before updated_at
+
+        var (v, body, author) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.Null(v);
+        Assert.Equal("", body);
+        Assert.Equal("", author);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_PicksReviewClosestToUpdatedAt()
+    {
+        // PR has multiple reviews; the one matching n.UpdatedAt fires the notification.
+        // Mock returns newest-first (same as the production client). The middle review is
+        // the trigger (~20s before updated_at = 17:07:58); confirm we pick it, not the
+        // newer-but-unrelated COMMENTED at 18:30 or the older APPROVED at 12:00.
+        StubReviews(
+            Review("COMMENTED", "2026-05-15T18:30:00Z", user: "carol", body: "later note"),
+            Review("APPROVED", "2026-05-15T17:07:37Z", user: "eesquibel", body: "the trigger"),
+            Review("APPROVED", "2026-05-15T12:00:00Z", user: "ithielnor", body: "earlier"));
+
+        var (v, body, author) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.Null(v);
+        Assert.Equal("the trigger", body);
+        Assert.Equal("eesquibel", author);
+    }
+
+    [Fact]
+    public async Task Quick_PrWithNoCommentUrl_DropEmptyApprovalsDisabled_FallsThrough()
+    {
+        // With the flag off, the L1.5 drop disappears — empty approval reaches L3.
+        _options.Triage.DropEmptyApprovals = false;
+        StubReviews(Review("APPROVED", "2026-05-15T17:07:37Z", user: "eesquibel"));
+
+        var (v, _, author) = await _pipeline.QuickTriageAsync(PrEvent(), default);
+
+        Assert.Null(v);
+        Assert.Equal("eesquibel", author);
+    }
+
+    [Fact]
+    public async Task Quick_IssueWithNoCommentUrl_DoesNotFetchReviews()
+    {
+        // L1.5 is PR-only. Issue notifications with no comment url (rare — issue assigned
+        // with no body) must not hit the PR reviews endpoint.
+        var n = N(type: "Issue", commentUrl: null);
+
+        var (v, _, _) = await _pipeline.QuickTriageAsync(n, default);
+
+        Assert.Null(v);
+        _gh.Verify(g => g.ListRecentPullRequestReviewsAsync(
+            It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     // ==================== AgentTriage (L3) ====================
@@ -580,15 +741,15 @@ public class TriagePipelineTests : IDisposable
     }
 
     [Fact]
-    public void ParseCommentIdFromUrl_HandlesNormalAndDegenerateCases()
+    public void ParseTrailingIdFromUrl_HandlesNormalAndDegenerateCases()
     {
-        Assert.Equal(12345, TriagePipeline.ParseCommentIdFromUrl(
+        Assert.Equal(12345, TriagePipeline.ParseTrailingIdFromUrl(
             "https://api.github.com/repos/o/r/issues/comments/12345"));
-        Assert.Null(TriagePipeline.ParseCommentIdFromUrl(null));
-        Assert.Null(TriagePipeline.ParseCommentIdFromUrl(""));
-        Assert.Null(TriagePipeline.ParseCommentIdFromUrl("/repos/o/r/issues/comments/not-a-number"));
-        Assert.Null(TriagePipeline.ParseCommentIdFromUrl("trailing/"));
-        Assert.Equal(42, TriagePipeline.ParseCommentIdFromUrl(
+        Assert.Null(TriagePipeline.ParseTrailingIdFromUrl(null));
+        Assert.Null(TriagePipeline.ParseTrailingIdFromUrl(""));
+        Assert.Null(TriagePipeline.ParseTrailingIdFromUrl("/repos/o/r/issues/comments/not-a-number"));
+        Assert.Null(TriagePipeline.ParseTrailingIdFromUrl("trailing/"));
+        Assert.Equal(42, TriagePipeline.ParseTrailingIdFromUrl(
             "https://api.github.com/repos/o/r/issues/comments/42?foo=bar"));
     }
 
