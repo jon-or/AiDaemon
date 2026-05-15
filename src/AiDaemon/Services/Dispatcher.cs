@@ -98,65 +98,72 @@ public class Dispatcher : IDispatcher
             ResetRcFields(rec);
         }
 
-        // Case 3: spawn from Idle. Three options for the session id we hand RC:
-        //   * Cross-tick resume — if we already have a session for this branch from a prior
-        //     dispatch, reuse it so the conversation history is preserved.
-        //   * Fresh pre-run — generate a new session id, run the headless pre-run agent in the
-        //     worktree to do the research/fix work, then RC resumes that session.
-        var seedSid = string.IsNullOrEmpty(rec.SessionId) ? null : rec.SessionId;
-        var preRunSummary = "";
+        // Case 3: spawn from Idle. Two sub-cases for the sid we hand pre-run + RC:
+        //   * Fresh: no prior session for this branch — generate a sid, run pre-run against
+        //     it, then RC resumes that session.
+        //   * Cross-tick resume: rec.SessionId carries over from a prior dispatch. Run
+        //     pre-run against THAT sid so the new comments' research/fix work appends to
+        //     the existing JSONL — when the user opens RC they see the prior conversation
+        //     plus the new turns. Without this, the user would just see a stale transcript
+        //     with no awareness of the comment that fired this dispatch.
+        var freshSid = string.IsNullOrEmpty(rec.SessionId);
+        string? seedSid;
 
-        if (seedSid == null)
+        if (freshSid)
         {
-            // No prior session for this branch — generate a sid and run the pre-run agent
-            // against it before opening RC. The pre-run is what actually does the work; RC
-            // is just the user's window into the resulting transcript.
             seedSid = Guid.NewGuid().ToString();
 
             // Persist the sid BEFORE the pre-run. The pre-run's wall-clock budget is 10
             // minutes and we may edit files in the worktree along the way. If the daemon
             // is killed mid-pre-run, we don't want the next dispatch to generate a brand
-            // new sid and re-run pre-run on the same worktree with the same instructions
-            // (duplicate edits, lost transcript continuity). With the sid persisted, a
-            // mid-pre-run crash → next dispatch sees rec.SessionId set → skips pre-run
-            // and resumes the same conversation.
+            // new sid and re-run pre-run on the same worktree from scratch (duplicate
+            // edits, lost transcript continuity). With the sid persisted, a mid-pre-run
+            // crash → next dispatch sees rec.SessionId set → re-runs pre-run on the SAME
+            // sid (the cross-tick path below), which appends rather than restarts.
             rec.SessionId = seedSid;
             await _store.UpsertBranchStateAsync(rec, cancellationToken);
-
-            try
-            {
-                var preRun = await _preRunner.RunAsync(seedSid, branch, items, verdict, cancellationToken);
-                preRunSummary = preRun.Summary;
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogWarning(ex,
-                    "pre-run threw — proceeding to RC anyway sid={Sid} branch={Branch}",
-                    seedSid, key);
-            }
-
-            // If the pre-run died before the agent wrote any turn (network blip on the very
-            // first response, hard timeout, or process crash) the JSONL file claude expects
-            // for `--resume <sid>` doesn't exist, and the RC window opens to a "No
-            // conversation found." message. Detect that and downgrade to a fresh spawn —
-            // the launcher will assign a new sid and we overwrite rec.SessionId after.
-            if (TryGetJsonlPath(rec, out var jsonlPath) && !_fs.FileExists(jsonlPath))
-            {
-                _logger.LogWarning(
-                    "pre-run wrote no JSONL for sid={Sid} branch={Branch} — falling back to fresh RC spawn",
-                    seedSid, key);
-                seedSid = null;
-                rec.SessionId = "";
-                // Don't persist here: SpawnRcAsync's success path overwrites rec.SessionId
-                // with the launcher-assigned value; if spawn itself fails, the catch below
-                // re-persists whatever sid we still have.
-            }
         }
         else
         {
+            seedSid = rec.SessionId;
             _logger.LogInformation(
-                "dispatch: reusing prior session sid={Sid} branch={Branch} — skipping pre-run",
+                "dispatch: resuming prior session sid={Sid} branch={Branch} — pre-run will append new turns",
                 seedSid, key);
+        }
+
+        var preRunSummary = "";
+        try
+        {
+            var preRun = await _preRunner.RunAsync(seedSid!, branch, items, verdict, cancellationToken);
+            preRunSummary = preRun.Summary;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "pre-run threw — proceeding to RC anyway sid={Sid} branch={Branch}",
+                seedSid, key);
+        }
+
+        // Empty-JSONL fallback only applies to a fresh sid. If the pre-run died before
+        // writing any turn (network blip on the first response, hard timeout, or process
+        // crash) the JSONL claude expects for `--resume <sid>` doesn't exist, and the RC
+        // window opens to a "No conversation found." message. Detect that and downgrade
+        // to a fresh spawn — the launcher will assign a new sid and we overwrite
+        // rec.SessionId after.
+        //
+        // For a cross-tick resume the JSONL is guaranteed to exist (the prior pre-run
+        // wrote it); even if the current pre-run did nothing, --resume still works against
+        // the prior turns, so we skip this fallback.
+        if (freshSid && TryGetJsonlPath(rec, out var jsonlPath) && !_fs.FileExists(jsonlPath))
+        {
+            _logger.LogWarning(
+                "pre-run wrote no JSONL for sid={Sid} branch={Branch} — falling back to fresh RC spawn",
+                seedSid, key);
+            seedSid = null;
+            rec.SessionId = "";
+            // Don't persist here: SpawnRcAsync's success path overwrites rec.SessionId
+            // with the launcher-assigned value; if spawn itself fails, the catch below
+            // re-persists whatever sid we still have.
         }
 
         // The pre-run's summary credits the requester by name and describes both ask + work

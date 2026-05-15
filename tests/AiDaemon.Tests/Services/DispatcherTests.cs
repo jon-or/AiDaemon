@@ -338,8 +338,12 @@ public class DispatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task CrossTickResume_ExistingSessionId_SkipsPreRunAndRespawns()
+    public async Task CrossTickResume_ExistingSessionId_RunsPreRunOnSameSidThenRespawns()
     {
+        // The new comments that fired this dispatch haven't been seen by the prior pre-run.
+        // Run pre-run again — against the SAME sid so the new turns append to the existing
+        // JSONL — otherwise the user opens RC to a stale transcript with no awareness of
+        // what fired the push. The agent sees the prior conversation as resume context.
         var branch = Branch();
         var existingSid = "previously-persisted-sid";
 
@@ -354,6 +358,13 @@ public class DispatcherTests : IDisposable
             IssueNumber = 16119,
         }, default);
 
+        string? capturedPreRunSid = null;
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .Callback((string sid, BranchInfo _, IReadOnlyList<NotificationWithBody> _, TriageVerdict _, CancellationToken _) => capturedPreRunSid = sid)
+            .ReturnsAsync(new PreRunResult(true, ""));
+
         _launcher.Setup(l => l.SpawnRcAsync(branch, existingSid, It.IsAny<CancellationToken>()))
             .ReturnsAsync(Att(sessionId: existingSid));
 
@@ -361,13 +372,13 @@ public class DispatcherTests : IDisposable
 
         Assert.Equal(DispatchOutcome.Spawned, outcome);
 
-        // Cross-tick resume must NOT re-run the pre-run agent — that's the whole reason we
-        // persist the sid early. Re-running would produce duplicate edits in the worktree.
+        // Pre-run runs on the EXISTING sid so its turns append to the existing JSONL.
+        Assert.Equal(existingSid, capturedPreRunSid);
         _preRunner.Verify(p => p.RunAsync(
                 It.IsAny<string>(), It.IsAny<BranchInfo>(),
                 It.IsAny<IReadOnlyList<NotificationWithBody>>(),
                 It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()),
-            Times.Never);
+            Times.Once);
 
         // Spawn was passed the existing sid, not a freshly generated one.
         _launcher.Verify(l => l.SpawnRcAsync(branch, existingSid, It.IsAny<CancellationToken>()), Times.Once);
@@ -375,6 +386,50 @@ public class DispatcherTests : IDisposable
         var rec = await _store.GetBranchStateAsync(branch.Key, default);
         Assert.Equal(existingSid, rec!.SessionId);
         Assert.Equal(BranchMode.RcActive, rec.Mode);
+    }
+
+    [Fact]
+    public async Task CrossTickResume_PreRunWroteNoNewJsonl_StillResumesExistingSid()
+    {
+        // On cross-tick resume the JSONL already exists from prior turns. If the new
+        // pre-run produces nothing (failed silently, or wrote no new turn), we must still
+        // resume the existing sid — the empty-JSONL fallback that downgrades to a fresh
+        // spawn is only for brand-new sids. Otherwise we'd discard a perfectly good
+        // conversation history on a transient pre-run hiccup.
+        var branch = Branch();
+        var existingSid = "previously-persisted-sid";
+
+        await _store.UpsertBranchStateAsync(new BranchState
+        {
+            Branch = branch.Key,
+            SessionId = existingSid,
+            Worktree = branch.Worktree,
+            Mode = BranchMode.Idle,
+            LastEventAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 100,
+            IssueNumber = 16119,
+        }, default);
+
+        _preRunner.Setup(p => p.RunAsync(It.IsAny<string>(), branch,
+                It.IsAny<IReadOnlyList<NotificationWithBody>>(),
+                It.IsAny<TriageVerdict>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(PreRunResult.Failed);
+
+        // FileExists returns false — would trip the empty-JSONL fallback if it were active
+        // on this path. The test asserts the fallback is gated to freshSid only.
+        _fs.Setup(f => f.FileExists(It.IsAny<string>())).Returns(false);
+
+        string? capturedSpawnSid = "(unset)";
+        _launcher.Setup(l => l.SpawnRcAsync(branch, It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Callback((BranchInfo _, string? sid, CancellationToken _) => capturedSpawnSid = sid)
+            .ReturnsAsync(Att(sessionId: existingSid));
+
+        var outcome = await Build().DispatchAsync(branch, new[] { new NotificationWithBody(N(), "body") }, V(), default);
+
+        Assert.Equal(DispatchOutcome.Spawned, outcome);
+        Assert.Equal(existingSid, capturedSpawnSid);
+
+        var rec = await _store.GetBranchStateAsync(branch.Key, default);
+        Assert.Equal(existingSid, rec!.SessionId);
     }
 
     [Fact]
